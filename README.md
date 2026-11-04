@@ -79,22 +79,43 @@ plugin_manager install_bundle(target = <本目录绝对路径>)
 
 `install_bundle` 接受四种目标：绝对目录、**tgz 包**、npm registry 包名、git 地址。
 
-### 方式一：从中心仓库安装（推荐，免凭据）
+### 方式一：命令行 `dsh plugin add`（推荐，一条命令）
 
 仓库：<https://github.com/yyqinfo/dsh-session-project-logs>
-Release 里挂着打包好的 tgz，一行命令装到任意机器：
+
+`dsh plugin --profile <档案名> <pnpm 参数>` 会把包装进档案，并**自动把这个 bundle 加进
+`dsh.profile.bundles`**（实测：装完 `package.json` 里同时出现 dependency 和 bundle 条目）。
+
+```
+# 从 Release 装（包已打好，最快）
+dsh plugin --profile web add "https://github.com/yyqinfo/dsh-session-project-logs/releases/download/v0.0.1/local-session-project-logs-0.0.1.tgz"
+
+# 或直接从仓库装（pnpm 会 clone 后打包）
+dsh plugin --profile web add "git+https://github.com/yyqinfo/dsh-session-project-logs.git"
+```
+
+装完**重启 DSH** 生效（命令行安装不经过运行中的 Host，热更新不会自己加载新 bundle）。
+卸载：
+
+```
+dsh plugin --profile web remove @local/session-project-logs
+```
+
+> - `--profile` 是必填项，`web` 就是 `dsh web` 用的那个档案；`dsh tui` 则是 `tui`。
+> - Desktop 用户把档案换成 `desktop`，并且要先完全退出 Desktop 再执行。
+> - 装之前最好先停掉 DSH：运行中的进程会占住它启动时加载的包。
+
+### 方式二：会话里用 `plugin_manager` 工具
+
+不想敲命令行时，在任意 DSH 会话里让 agent 调 `plugin_manager`：
 
 ```
 plugin_manager install_bundle(target = "https://github.com/yyqinfo/dsh-session-project-logs/releases/download/v0.0.1/local-session-project-logs-0.0.1.tgz")
 ```
 
-也可以直接从仓库装（pnpm 会 clone 后打包）：
+它走的是运行中的 Host 的插件管理器，能热加载（不需要重启），并且会返回 `application` 结果。
 
-```
-plugin_manager install_bundle(target = "git+https://github.com/yyqinfo/dsh-session-project-logs.git")
-```
-
-### 方式二：本地打 tgz 再拷过去
+### 方式三：本地打 tgz 再拷过去
 
 ```
 npm pack                     # 生成 local-session-project-logs-0.0.1.tgz（约 21 KB）
@@ -103,8 +124,10 @@ npm pack                     # 生成 local-session-project-logs-0.0.1.tgz（约
 把 tgz 拷到目标机器，然后：
 
 ```
-plugin_manager install_bundle(target = "C:/Temp/local-session-project-logs-0.0.1.tgz")
+dsh plugin --profile web add "C:/Temp/local-session-project-logs-0.0.1.tgz"
 ```
+
+或 `plugin_manager install_bundle(target = "C:/Temp/local-session-project-logs-0.0.1.tgz")`。
 
 装进去的是**拷贝**（`pnpm add file:...tgz`），不依赖你本机的源码目录。
 命令行工具随之安装在 profile 里：
@@ -112,13 +135,12 @@ plugin_manager install_bundle(target = "C:/Temp/local-session-project-logs-0.0.1
 ```
 node "$env:DSH_PROFILE_DIR/node_modules/@local/session-project-logs/bin/session-project-logs.mjs" status
 ```
-
-### 方式三：直接把目录拷过去
+### 方式四：直接把目录拷过去
 
 把整个 `session-project-logs` 目录放到目标机器某个固定路径，用目录路径作为安装目标。
 注意 pnpm 会做成 `link:`，**这个目录以后不能删或移动**，否则插件失效。
 
-### 方式四：发到 npm registry（多台机器统一升级）
+### 方式五：发到 npm registry（多台机器统一升级）
 
 先把 `package.json` 的 `private` 去掉、`name` 换成自己在 npm 上拥有的 scope
 （`@local` 不是可发布的 scope），`npm publish --access public` 之后：
@@ -147,8 +169,11 @@ git 地址与 tarball URL 也可以直接作为目标。
 
 ### 升级与卸载
 
-- **升级**：版本号 +1，重新 `npm pack`；目标机器先 `remove_bundle`，再 `install_bundle` 新 tgz，
-  然后重启 DSH（替换已安装包需要重启才会加载新的 JS 模块）。
+- **升级**：版本号 +1、重新打包并更新 Release 资产；目标机器直接
+  `dsh plugin --profile web add "<新 tgz 地址>"` 覆盖旧版本，然后重启 DSH
+  （替换已安装包需要重启才会加载新的 JS 模块）。
+- **卸载**：`dsh plugin --profile web remove @local/session-project-logs`
+  （`plugin_manager` 里用 `remove_bundle`）。
 - **停用（保留数据）**：`plugin_manager set_plugin(enabled=false, target="include:session-project-logs")`，
   立即把持久化入口还原成官方实现，新会话回中心根目录；项目目录里的日志仍可读。
 - **撤销迁移**：停掉 DSH 后 `node bin/session-project-logs.mjs restore --all`。
