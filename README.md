@@ -79,16 +79,31 @@ plugin_manager install_bundle(target = <本目录绝对路径>)
 
 `install_bundle` 接受四种目标：绝对目录、**tgz 包**、npm registry 包名、git 地址。
 
-### 方式一：发一个 tgz（推荐，不需要 registry）
+### 方式一：从中心仓库安装（推荐，免凭据）
+
+仓库：<https://github.com/yyqinfo/dsh-session-project-logs>
+Release 里挂着打包好的 tgz，一行命令装到任意机器：
 
 ```
-npm pack                     # 生成 local-session-project-logs-1.0.0.tgz（约 20 KB）
+plugin_manager install_bundle(target = "https://github.com/yyqinfo/dsh-session-project-logs/releases/download/v0.0.1/local-session-project-logs-0.0.1.tgz")
+```
+
+也可以直接从仓库装（pnpm 会 clone 后打包）：
+
+```
+plugin_manager install_bundle(target = "git+https://github.com/yyqinfo/dsh-session-project-logs.git")
+```
+
+### 方式二：本地打 tgz 再拷过去
+
+```
+npm pack                     # 生成 local-session-project-logs-0.0.1.tgz（约 21 KB）
 ```
 
 把 tgz 拷到目标机器，然后：
 
 ```
-plugin_manager install_bundle(target = "C:/Temp/local-session-project-logs-1.0.0.tgz")
+plugin_manager install_bundle(target = "C:/Temp/local-session-project-logs-0.0.1.tgz")
 ```
 
 装进去的是**拷贝**（`pnpm add file:...tgz`），不依赖你本机的源码目录。
@@ -98,18 +113,18 @@ plugin_manager install_bundle(target = "C:/Temp/local-session-project-logs-1.0.0
 node "$env:DSH_PROFILE_DIR/node_modules/@local/session-project-logs/bin/session-project-logs.mjs" status
 ```
 
-### 方式二：直接把目录拷过去
+### 方式三：直接把目录拷过去
 
-把整个 `session-project-logs` 目录放到目标机器某个固定路径，用方式里的目录目标安装。
+把整个 `session-project-logs` 目录放到目标机器某个固定路径，用目录路径作为安装目标。
 注意 pnpm 会做成 `link:`，**这个目录以后不能删或移动**，否则插件失效。
 
-### 方式三：发到 registry（多台机器统一升级）
+### 方式四：发到 npm registry（多台机器统一升级）
 
-先把 `package.json` 的 `private` 去掉、`name` 换成自己的 scope（`@local` 不是可发布的 scope），
-`npm publish` 之后在目标机器：
+先把 `package.json` 的 `private` 去掉、`name` 换成自己在 npm 上拥有的 scope
+（`@local` 不是可发布的 scope），`npm publish --access public` 之后：
 
 ```
-plugin_manager install_bundle(target = "@your-scope/session-project-logs@^1.0.0")
+plugin_manager install_bundle(target = "@your-scope/session-project-logs@^0.0.1")
 ```
 
 git 地址与 tarball URL 也可以直接作为目标。

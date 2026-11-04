@@ -1,6 +1,6 @@
 {
   "name": "@local/session-project-logs",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "description": "Keep each project's DSH session logs inside the project (.dsh/sessions) instead of the central ~/.dsh/sessions root",
@@ -32,5 +32,16 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yyqinfo/dsh-session-project-logs.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "session",
+    "storage",
+    "jsonl"
+  ]
 }
