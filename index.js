@@ -88,10 +88,15 @@ async function install(ctx, settings, service, urls, log) {
   }
   const state = {
     mounted: new Map(), // project cwd (pathKey) -> { project, root, backend }
-    byId: new Map(), // session id -> backend | CENTRAL
+    byId: new Map(), // session id -> backend | CENTRAL (resolved cache)
+    index: core.readIndex(settings).sessions, // session id -> root path | 'central'
+    locating: new Map(), // session id -> in-flight locate promise
+    misses: new Map(), // session id -> timestamp of the last failed lookup
     projects: new Set(core.readRegistry(settings).projects),
     counts: { created: 0, central: 0, mounted: 0, fallbacks: 0, errors: 0 },
     registryTimer: undefined,
+    indexTimer: undefined,
+    indexDirty: false,
   }
 
   const ready = mountRegisteredProjects()
@@ -109,6 +114,8 @@ async function install(ctx, settings, service, urls, log) {
   }
 
   const LIST_CACHE_MS = 500
+  /** How long a failed lookup is remembered, so repeated misses stop re-scanning. */
+  const MISS_TTL_MS = 5000
   let listCache
   let listPromise
   const invalidateList = () => {
@@ -123,20 +130,20 @@ async function install(ctx, settings, service, urls, log) {
     invalidateList()
     if (backend === undefined) {
       const handle = await original.create(header, options)
-      state.byId.set(header.id, CENTRAL)
+      remember(header.id, CENTRAL)
       state.counts.central += 1
       return handle
     }
     try {
       const handle = await backend.create(header, options)
-      state.byId.set(header.id, backend)
+      remember(header.id, backend, core.projectSessionRoot(settings, cwd))
       state.counts.created += 1
       return handle
     } catch (error) {
       state.counts.fallbacks += 1
       log.warn(`cannot create "${String(header.id)}" in its project directory (${describe(error)}); using the central root`)
       const handle = await original.create(header, options)
-      state.byId.set(header.id, CENTRAL)
+      remember(header.id, CENTRAL)
       return handle
     }
   }
@@ -204,13 +211,13 @@ async function install(ctx, settings, service, urls, log) {
     const snapshots = []
     for (const snapshot of centralSnapshots) {
       snapshots.push(snapshot)
-      state.byId.set(snapshot.header.id, CENTRAL)
+      remember(snapshot.header.id, CENTRAL)
     }
     projectLists.forEach((local, index) => {
-      const backend = projects[index].backend
+      const project = projects[index]
       for (const snapshot of local) {
         snapshots.push(snapshot)
-        state.byId.set(snapshot.header.id, backend)
+        remember(snapshot.header.id, project.backend, project.root)
       }
     })
     return snapshots
@@ -245,8 +252,30 @@ async function install(ctx, settings, service, urls, log) {
   }, 10_000)
   if (typeof reportTimer.unref === 'function') reportTimer.unref()
 
+  // Drop index entries whose session directory is gone once startup has settled;
+  // a stale hint would make every lookup fall through to the slow scan.
+  const pruneTimer = setTimeout(() => {
+    try {
+      const removed = core.pruneIndex(settings, state.index)
+      if (removed.length > 0) {
+        state.indexDirty = true
+        flushIndex()
+        log.debug(`index pruned: ${removed.length} entr${removed.length === 1 ? 'y' : 'ies'} dropped`)
+      }
+    } catch (error) {
+      log.warn(`cannot prune the session index: ${describe(error)}`)
+    }
+  }, 5000)
+  if (typeof pruneTimer.unref === 'function') pruneTimer.unref()
+
   ctx.effect(() => () => {
     clearInterval(reportTimer)
+    clearTimeout(pruneTimer)
+    if (state.indexTimer !== undefined) {
+      clearTimeout(state.indexTimer)
+      state.indexTimer = undefined
+    }
+    flushIndex()
     // Leave the provider exactly as it was found: drop the own properties, so the
     // prototype methods take over again even while the host keeps running.
     for (const method of ['create', 'open', 'stat', 'list', 'flush']) delete service[method]
@@ -269,6 +298,17 @@ async function install(ctx, settings, service, urls, log) {
 
   writeReport()
   log.info(`routing new sessions into project directories under <project>/${settings.dirName}`)
+
+  // Warm the lookup index in the background: the first page load asks `stat` for
+  // many sessions before it lists, and a warm index turns each of those into a
+  // map hit instead of a scan across every project backend.
+  void ready
+    .then(() => service.list())
+    .then((snapshots) => {
+      flushIndex()
+      log.debug(`session index ready: ${snapshots.length} sessions`)
+    })
+    .catch((error) => log.warn(`cannot warm the session index: ${describe(error)}`))
 
   /** Mount every project recorded by the previous run so its sessions stay visible. */
   async function mountRegisteredProjects() {
@@ -316,34 +356,94 @@ async function install(ctx, settings, service, urls, log) {
   }
 
   /**
-   * Resolve the backend that owns a session id, filling the index as it goes.
+   * Resolve the backend that owns a session id.
    *
-   * The fallback asks every project backend at once: a central-root session used
-   * to cost one directory scan per project (33–89 ms measured), which is the kind
-   * of latency a page load multiplies by the number of sessions it touches.
+   * The persisted index answers the common case with a map hit. Only a genuinely
+   * unknown id scans, and then only once per burst: concurrent lookups of the same
+   * id share one scan, and a failed lookup is remembered briefly so a client that
+   * keeps asking for a gone session does not re-scan every backend each time.
    */
   async function locate(id) {
     await ready
     const cached = state.byId.get(id)
     if (cached !== undefined) return cached
+    const hinted = state.index.get(id)
+    if (hinted !== undefined) {
+      const backend = hinted === core.CENTRAL_MARKER ? CENTRAL : mountedForRoot(hinted)
+      if (backend !== undefined) {
+        state.byId.set(id, backend)
+        return backend
+      }
+    }
+    const missedAt = state.misses.get(id)
+    if (missedAt !== undefined && Date.now() - missedAt < MISS_TTL_MS) return undefined
+    const inFlight = state.locating.get(id)
+    if (inFlight !== undefined) return inFlight
+    const work = scanFor(id)
+    state.locating.set(id, work)
+    try {
+      const found = await work
+      if (found === undefined) state.misses.set(id, Date.now())
+      return found
+    } finally {
+      state.locating.delete(id)
+    }
+  }
+
+  /** The one expensive lookup: ask every backend, then the central root. */
+  async function scanFor(id) {
     const projects = [...state.mounted.values()]
-    const found = (await Promise.all(projects.map(async (project) => {
+    const hit = (await Promise.all(projects.map(async (project) => {
       try {
-        return (await project.backend.stat(id)) !== undefined ? project.backend : undefined
+        return (await project.backend.stat(id)) !== undefined ? project : undefined
       } catch (error) {
         log.warn(`cannot stat "${String(id)}" in ${project.root}: ${describe(error)}`)
         return undefined
       }
-    }))).find((backend) => backend !== undefined)
-    if (found !== undefined) {
-      state.byId.set(id, found)
-      return found
+    }))).find((project) => project !== undefined)
+    if (hit !== undefined) {
+      remember(id, hit.backend, hit.root)
+      return hit.backend
     }
     if (await original.stat(id) !== undefined) {
-      state.byId.set(id, CENTRAL)
+      remember(id, CENTRAL)
       return CENTRAL
     }
     return undefined
+  }
+
+  function mountedForRoot(root) {
+    for (const project of state.mounted.values()) {
+      if (core.samePath(project.root, root)) return project.backend
+    }
+    return undefined
+  }
+
+  /** Cache a lookup result and record it in the persisted index. */
+  function remember(id, backend, root) {
+    state.byId.set(id, backend)
+    state.misses.delete(id)
+    const marker = backend === CENTRAL ? core.CENTRAL_MARKER : root
+    if (marker === undefined) return
+    if (state.index.get(id) === marker) return
+    state.index.set(id, marker)
+    state.indexDirty = true
+    scheduleIndexWrite()
+  }
+
+  function scheduleIndexWrite() {
+    if (settings.indexPath === '' || state.indexTimer !== undefined) return
+    state.indexTimer = setTimeout(() => {
+      state.indexTimer = undefined
+      flushIndex()
+    }, 2000)
+    if (typeof state.indexTimer.unref === 'function') state.indexTimer.unref()
+  }
+
+  function flushIndex() {
+    if (!state.indexDirty) return
+    core.writeIndex(settings, state.index)
+    state.indexDirty = false
   }
 
   function scheduleRegistryWrite() {
