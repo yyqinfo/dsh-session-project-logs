@@ -96,7 +96,7 @@ async function install(ctx, settings, service, urls, log) {
     idSets: new Map(), // root -> { at, promise<Set<encoded id>> }
     statCache: new Map(), // session id -> { at, snapshot }
     projects: new Set(core.readRegistry(settings).projects),
-    counts: { created: 0, central: 0, mounted: 0, fallbacks: 0, errors: 0, listScans: 0, listCached: 0, listStale: 0, statCached: 0, missScans: 0, idSetBuilds: 0 },
+    counts: { created: 0, central: 0, mounted: 0, fallbacks: 0, errors: 0, listScans: 0, listCached: 0, listValidated: 0, validateDropped: 0, statCached: 0, missScans: 0, idSetBuilds: 0 },
     registryTimer: undefined,
     indexTimer: undefined,
     indexDirty: false,
@@ -117,26 +117,25 @@ async function install(ctx, settings, service, urls, log) {
   }
 
   /**
-   * How long a merged listing is served without refreshing.
+   * How long a merged listing is served without any check.
    *
-   * A merge reads 823 session headers across 36 backends (~1.5 s in-host). Past this
-   * window the cached listing is still returned *immediately* while a refresh runs
-   * in the background, so a page load never waits for a scan; only an invalidation
-   * (a session created, disposed or renamed here) makes the next call scan up front,
-   * because that is exactly when the answer must be current.
+   * A merge reads 823 session headers across 36 backends (~1.5-1.8 s in-host), which a
+   * page load must not pay. Past this window the listing is validated instead: one
+   * existence check per session directory (~20 ms) drops what another tool deleted,
+   * and the scan that refreshes sizes and titles runs behind the caller.
    */
   const LIST_FRESH_MS = 30000
   /**
-   * Past this age the cached listing is dropped instead of served stale.
+   * Past this age the cached listing is dropped and the next call scans up front.
    *
-   * Kept generous on purpose: a refresh that lands minutes after the last one used to
-   * pay a full merge (2.4 s in-host). Changes made by this process are never hidden —
-   * `session/created`, `session/disposed` and `session/title` invalidate at once — so
-   * the window only bounds how long a change made by *another* process can be missed.
+   * Generous on purpose: refreshes arrive minutes apart, and an unvalidated cache is
+   * harmless because changes made here invalidate at once and deletions are caught by
+   * the validation above. This only bounds how long a *renamed* session can keep a
+   * stale title when the rename came from another process.
    */
-  const LIST_STALE_MS = 180000
+  const LIST_STALE_MS = 1800000
   /** A single backend's snapshot list is trusted as long as the merged one. */
-  const BACKEND_LIST_CACHE_MS = 180000
+  const BACKEND_LIST_CACHE_MS = 1800000
   /** `stat()` answers a change token; 1.5 s of staleness is far cheaper than a rescan. */
   const STAT_CACHE_MS = 1500
   /** How long a failed lookup is remembered, so repeated misses stop re-scanning. */
@@ -263,12 +262,39 @@ async function install(ctx, settings, service, urls, log) {
         return listCache.value
       }
       if (age < LIST_STALE_MS) {
-        state.counts.listStale += 1
+        // The listing is old enough to distrust, but a full scan is not needed to know
+        // whether it is still *valid*: one existence check per session directory
+        // (~20 ms for 823) drops whatever another tool deleted, and the scan that
+        // refreshes sizes and titles runs behind the caller.
+        state.counts.listValidated += 1
+        const value = pruneVanished()
         if (listPromise === undefined) void refreshList().catch(() => {})
-        return listCache.value
+        return value
       }
     }
     return refreshList()
+  }
+
+  /** Drop cached snapshots whose session directory no longer exists. */
+  function pruneVanished() {
+    if (listCache === undefined) return []
+    let dropped = 0
+    const kept = []
+    for (const snapshot of listCache.value) {
+      const dir = listCache.dirs.get(snapshot.header.id)
+      if (dir !== undefined && !fs.existsSync(dir)) {
+        listCache.dirs.delete(snapshot.header.id)
+        dropped += 1
+        continue
+      }
+      kept.push(snapshot)
+    }
+    if (dropped > 0) {
+      state.counts.validateDropped += dropped
+      listCache = { ...listCache, value: kept }
+      log.debug(`listing validation dropped ${dropped} session(s) removed outside this process`)
+    }
+    return kept
   }
 
   /** Scan every backend and store the merged result (single flight). */
@@ -277,8 +303,8 @@ async function install(ctx, settings, service, urls, log) {
     state.counts.listScans += 1
     const started = process.hrtime.bigint()
     listPromise = computeList()
-      .then((snapshots) => {
-        listCache = { at: Date.now(), value: snapshots }
+      .then(({ snapshots, dirs }) => {
+        listCache = { at: Date.now(), value: snapshots, dirs }
         return snapshots
       })
       .finally(() => {
@@ -311,18 +337,21 @@ async function install(ctx, settings, service, urls, log) {
       Promise.all(projects.map((project) => backendList(project.backend, project.backend, project.root))),
     ])
     const snapshots = []
+    const dirs = new Map()
     for (const snapshot of centralSnapshots) {
       snapshots.push(snapshot)
       remember(snapshot.header.id, CENTRAL)
+      dirs.set(snapshot.header.id, core.sessionDirectory(settings.root, snapshot.header.cwd, snapshot.header.id))
     }
     projectLists.forEach((local, index) => {
       const project = projects[index]
       for (const snapshot of local) {
         snapshots.push(snapshot)
         remember(snapshot.header.id, project.backend, project.root)
+        dirs.set(snapshot.header.id, core.sessionDirectory(project.root, snapshot.header.cwd, snapshot.header.id))
       }
     })
-    return snapshots
+    return { snapshots, dirs }
   }
 
   service.flush = async () => {
