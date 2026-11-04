@@ -92,6 +92,8 @@ async function install(ctx, settings, service, urls, log) {
     index: core.readIndex(settings).sessions, // session id -> root path | 'central'
     locating: new Map(), // session id -> in-flight locate promise
     misses: new Map(), // session id -> timestamp of the last failed lookup
+    backendLists: new Map(), // backend | CENTRAL -> { at, snapshots }
+    statCache: new Map(), // session id -> { at, snapshot }
     projects: new Set(core.readRegistry(settings).projects),
     counts: { created: 0, central: 0, mounted: 0, fallbacks: 0, errors: 0 },
     registryTimer: undefined,
@@ -113,13 +115,22 @@ async function install(ctx, settings, service, urls, log) {
     timings.set(name, entry)
   }
 
-  const LIST_CACHE_MS = 500
+  const LIST_CACHE_MS = 3000
+  /** A single backend's snapshot list is reused this long; 823 headers per scan is the cost. */
+  const BACKEND_LIST_CACHE_MS = 5000
+  /** `stat()` answers a change token; 1.5 s of staleness is far cheaper than a rescan. */
+  const STAT_CACHE_MS = 1500
   /** How long a failed lookup is remembered, so repeated misses stop re-scanning. */
   const MISS_TTL_MS = 5000
   let listCache
   let listPromise
   const invalidateList = () => {
     listCache = undefined
+    state.backendLists.clear()
+  }
+  const invalidateStat = (id) => {
+    if (id === undefined) state.statCache.clear()
+    else state.statCache.delete(id)
   }
 
   service.create = async (header, options) => {
@@ -128,6 +139,7 @@ async function install(ctx, settings, service, urls, log) {
     let backend
     if (cwd !== undefined) backend = await backendFor(cwd)
     invalidateList()
+    invalidateStat(header.id)
     if (backend === undefined) {
       const handle = await original.create(header, options)
       remember(header.id, CENTRAL)
@@ -171,10 +183,16 @@ async function install(ctx, settings, service, urls, log) {
   service.stat = async (id, options) => {
     const started = process.hrtime.bigint()
     try {
+      const cached = state.statCache.get(id)
+      if (cached !== undefined && Date.now() - cached.at < STAT_CACHE_MS) return cached.snapshot
       const found = await locate(id)
       if (found === undefined) return undefined
       const snapshot = found === CENTRAL ? await original.stat(id, options) : await found.stat(id, options)
-      if (snapshot !== undefined) return snapshot
+      if (snapshot !== undefined) {
+        state.statCache.set(id, { at: Date.now(), snapshot })
+        return snapshot
+      }
+      invalidateStat(id)
       const retried = await relocate(id)
       if (retried === undefined) return undefined
       return retried === CENTRAL ? original.stat(id, options) : retried.stat(id, options)
@@ -186,40 +204,54 @@ async function install(ctx, settings, service, urls, log) {
   /**
    * Merge every backend's listing.
    *
-   * Two guards keep the page-load path cheap: the project backends are scanned in
-   * parallel instead of one after another, and concurrent callers share one scan
-   * (`listPromise`) whose result is reused for a few hundred milliseconds — the
-   * GUI asks for the list several times while a page loads.
+   * A scan reads 823 session headers, so it is served from two caches instead of
+   * being repeated for every page load:
+   *
+   * - each backend's own snapshot list is reused for a few seconds;
+   * - the merged result is reused for a moment, and concurrent callers share one
+   *   in-flight scan, so a burst of list() calls costs a single scan.
+   *
+   * A created or disposed session drops both, so nothing is hidden for long.
    */
   service.list = async (options) => {
     await ready
-    const cacheable = options === undefined || options.signal === undefined
-    if (cacheable) {
-      if (listCache !== undefined && Date.now() - listCache.at < LIST_CACHE_MS) return listCache.value
-      if (listPromise !== undefined) return listPromise
-    }
+    if (options?.signal?.aborted === true) throw new DOMException('This operation was aborted', 'AbortError')
+    if (listCache !== undefined && Date.now() - listCache.at < LIST_CACHE_MS) return listCache.value
+    if (listPromise !== undefined) return listPromise
     const started = process.hrtime.bigint()
-    const work = computeList(options)
-    if (cacheable) listPromise = work
+    const work = computeList()
+    listPromise = work
     try {
       const snapshots = await work
-      if (cacheable) listCache = { at: Date.now(), value: snapshots }
+      listCache = { at: Date.now(), value: snapshots }
       return snapshots
     } finally {
-      if (cacheable) listPromise = undefined
+      listPromise = undefined
       recordTiming('list', started)
     }
   }
 
-  async function computeList(options) {
+  /** One backend's listing, reused for {@link BACKEND_LIST_CACHE_MS}. */
+  async function backendList(key, backend, label) {
+    const cached = state.backendLists.get(key)
+    if (cached !== undefined && Date.now() - cached.at < BACKEND_LIST_CACHE_MS) return cached.snapshots
+    let snapshots
+    try {
+      snapshots = await backend.list()
+    } catch (error) {
+      state.counts.errors += 1
+      log.warn(`cannot list ${label}: ${describe(error)}`)
+      return []
+    }
+    state.backendLists.set(key, { at: Date.now(), snapshots })
+    return snapshots
+  }
+
+  async function computeList() {
     const projects = [...state.mounted.values()]
     const [centralSnapshots, projectLists] = await Promise.all([
-      original.list(options),
-      Promise.all(projects.map((project) => project.backend.list(options).catch((error) => {
-        state.counts.errors += 1
-        log.warn(`cannot list ${project.root}: ${describe(error)}`)
-        return []
-      }).then((value) => value))),
+      backendList(CENTRAL, original, `the central root ${settings.root}`),
+      Promise.all(projects.map((project) => backendList(project.backend, project.backend, project.root))),
     ])
     const snapshots = []
     for (const snapshot of centralSnapshots) {
@@ -250,15 +282,24 @@ async function install(ctx, settings, service, urls, log) {
         }
       }
       if (failures.length > 0) throw new AggregateError(failures, 'project-local session flush failed')
+      // A flush only adds bytes to an existing session; the short `stat` cache
+      // bounds that staleness, and clearing it here would defeat the cache — the
+      // host flushes after every batch of appends.
     } finally {
       recordTiming('flush', started)
     }
   }
 
-  // A created or disposed session changes the merged list right away; the short
-  // cache must not hide it.
-  ctx.on('session/created', () => invalidateList())
-  ctx.on('session/disposed', () => invalidateList())
+  // A created or disposed session changes the merged list and the change tokens
+  // right away; the caches must not hide it.
+  ctx.on('session/created', () => {
+    invalidateList()
+    invalidateStat()
+  })
+  ctx.on('session/disposed', () => {
+    invalidateList()
+    invalidateStat()
+  })
 
   const reportTimer = setInterval(() => {
     if (timings.size > 0) writeReport()
