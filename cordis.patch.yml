@@ -1,0 +1,11 @@
+# Project-local session logs: new sessions are stored by a JSONL backend mounted
+# on <project>/.dsh/sessions instead of the central <DSH_HOME>/sessions root.
+# Sessions already stored centrally stay readable and resumable on that root;
+# `node bin/session-project-logs.mjs migrate` moves them once, with DSH stopped.
+- insert:
+    - id: session-project-logs
+      name: '@local/session-project-logs'
+      config:
+        dirName: .dsh/sessions
+        routeNewSessions: true
+        gitignore: true

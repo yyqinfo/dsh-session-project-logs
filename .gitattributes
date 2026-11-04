@@ -1,0 +1,6 @@
+# Normalise line endings: the sources are LF on every platform.
+* text=auto eol=lf
+
+# Generated and local-only files stay out of diffs.
+*.tgz binary
+*.zstd binary

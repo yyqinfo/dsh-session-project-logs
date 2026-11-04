@@ -1,0 +1,36 @@
+{
+  "name": "@local/session-project-logs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Keep each project's DSH session logs inside the project (.dsh/sessions) instead of the central ~/.dsh/sessions root",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./core": "./lib/core.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "bin": {
+    "session-project-logs": "./bin/session-project-logs.mjs"
+  },
+  "scripts": {
+    "test": "node test/core.test.mjs && node test/routing.test.mjs"
+  },
+  "files": [
+    "index.js",
+    "lib/core.js",
+    "lib/harness.js",
+    "bin/session-project-logs.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "test/*.test.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

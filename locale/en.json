@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Project Session Logs",
+    "description": "Stores each project's session logs under <project>/.dsh/sessions instead of the central ~/.dsh/sessions root."
+  }
+}

@@ -1,0 +1,12 @@
+# Build artifacts
+*.tgz
+*.tar.gz
+
+# Test sandboxes (created and removed by the suites, but never committed)
+test/tmp/
+
+# Node
+node_modules/
+
+# Logs and local reports
+*.log

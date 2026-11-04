@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "项目内会话日志",
+    "description": "把每个项目的会话日志保存到项目目录下的 .dsh/sessions，而不再集中放在 ~/.dsh/sessions。"
+  }
+}
