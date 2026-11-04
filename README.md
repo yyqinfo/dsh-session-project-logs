@@ -96,7 +96,7 @@ plugin_manager install_bundle(target = <本目录绝对路径>)
 
 ```
 # 从 Release 装（包已打好，最快）
-dsh plugin --profile web add "https://github.com/yyqinfo/dsh-session-project-logs/releases/download/v0.0.1/local-session-project-logs-0.0.1.tgz"
+dsh plugin --profile web add "https://github.com/yyqinfo/dsh-session-project-logs/releases/download/v0.0.2/local-session-project-logs-0.0.2.tgz"
 
 # 或直接从仓库装（pnpm 会 clone 后打包）
 dsh plugin --profile web add "git+https://github.com/yyqinfo/dsh-session-project-logs.git"
@@ -118,7 +118,7 @@ dsh plugin --profile web remove @local/session-project-logs
 不想敲命令行时，在任意 DSH 会话里让 agent 调 `plugin_manager`：
 
 ```
-plugin_manager install_bundle(target = "https://github.com/yyqinfo/dsh-session-project-logs/releases/download/v0.0.1/local-session-project-logs-0.0.1.tgz")
+plugin_manager install_bundle(target = "https://github.com/yyqinfo/dsh-session-project-logs/releases/download/v0.0.2/local-session-project-logs-0.0.2.tgz")
 ```
 
 它走的是运行中的 Host 的插件管理器，能热加载（不需要重启），并且会返回 `application` 结果。
@@ -126,16 +126,16 @@ plugin_manager install_bundle(target = "https://github.com/yyqinfo/dsh-session-p
 ### 方式三：本地打 tgz 再拷过去
 
 ```
-npm pack                     # 生成 local-session-project-logs-0.0.1.tgz（约 21 KB）
+npm pack                     # 生成 local-session-project-logs-0.0.2.tgz（约 21 KB）
 ```
 
 把 tgz 拷到目标机器，然后：
 
 ```
-dsh plugin --profile web add "C:/Temp/local-session-project-logs-0.0.1.tgz"
+dsh plugin --profile web add "C:/Temp/local-session-project-logs-0.0.2.tgz"
 ```
 
-或 `plugin_manager install_bundle(target = "C:/Temp/local-session-project-logs-0.0.1.tgz")`。
+或 `plugin_manager install_bundle(target = "C:/Temp/local-session-project-logs-0.0.2.tgz")`。
 
 装进去的是**拷贝**（`pnpm add file:...tgz`），不依赖你本机的源码目录。
 命令行工具随之安装在 profile 里：
@@ -154,7 +154,7 @@ node "$env:DSH_PROFILE_DIR/node_modules/@local/session-project-logs/bin/session-
 （`@local` 不是可发布的 scope），`npm publish --access public` 之后：
 
 ```
-plugin_manager install_bundle(target = "@your-scope/session-project-logs@^0.0.1")
+plugin_manager install_bundle(target = "@your-scope/session-project-logs@^0.0.2")
 ```
 
 git 地址与 tarball URL 也可以直接作为目标。
