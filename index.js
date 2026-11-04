@@ -93,6 +93,7 @@ async function install(ctx, settings, service, urls, log) {
     locating: new Map(), // session id -> in-flight locate promise
     misses: new Map(), // session id -> timestamp of the last failed lookup
     backendLists: new Map(), // backend | CENTRAL -> { at, snapshots }
+    idSets: new Map(), // root -> { at, promise<Set<encoded id>> }
     statCache: new Map(), // session id -> { at, snapshot }
     projects: new Set(core.readRegistry(settings).projects),
     counts: { created: 0, central: 0, mounted: 0, fallbacks: 0, errors: 0 },
@@ -116,21 +117,25 @@ async function install(ctx, settings, service, urls, log) {
   }
 
   /**
-   * How long a merged listing is trusted.
+   * How long a merged listing is served without refreshing.
    *
-   * A merge costs one scan of every backend (823 session headers, ~1.5 s in-host),
-   * and the GUI asks for the list on every page load. The window is deliberately
-   * long: a session created, disposed or renamed *here* drops the cache at once
-   * (`session/created` / `session/disposed` / `session/title`), so the only thing
-   * the window can hide is a change made by another process.
+   * A merge reads 823 session headers across 36 backends (~1.5 s in-host). Past this
+   * window the cached listing is still returned *immediately* while a refresh runs
+   * in the background, so a page load never waits for a scan; only an invalidation
+   * (a session created, disposed or renamed here) makes the next call scan up front,
+   * because that is exactly when the answer must be current.
    */
-  const LIST_CACHE_MS = 60000
+  const LIST_FRESH_MS = 15000
+  /** Past this age the cached listing is dropped instead of served stale. */
+  const LIST_STALE_MS = 300000
   /** A single backend's snapshot list is trusted as long as the merged one. */
   const BACKEND_LIST_CACHE_MS = 60000
   /** `stat()` answers a change token; 1.5 s of staleness is far cheaper than a rescan. */
   const STAT_CACHE_MS = 1500
   /** How long a failed lookup is remembered, so repeated misses stop re-scanning. */
   const MISS_TTL_MS = 5000
+  /** How long a root's cheap directory-name index is trusted. */
+  const ID_SET_TTL_MS = 30000
   let listCache
   let listPromise
   const dropMerged = () => {
@@ -139,6 +144,7 @@ async function install(ctx, settings, service, urls, log) {
   const invalidateList = () => {
     dropMerged()
     state.backendLists.clear()
+    state.idSets.clear()
   }
   const invalidateStat = (id) => {
     if (id === undefined) state.statCache.clear()
@@ -216,31 +222,44 @@ async function install(ctx, settings, service, urls, log) {
   /**
    * Merge every backend's listing.
    *
-   * A scan reads 823 session headers, so it is served from two caches instead of
-   * being repeated for every page load:
+   * The merge is the expensive operation (one scan of every backend), so a page load
+   * must never wait for one it does not need:
    *
-   * - each backend's own snapshot list is reused for a few seconds;
-   * - the merged result is reused for a moment, and concurrent callers share one
-   *   in-flight scan, so a burst of list() calls costs a single scan.
-   *
-   * A created or disposed session drops both, so nothing is hidden for long.
+   * - within {@link LIST_FRESH_MS} the cached listing is returned as is;
+   * - past that, the cached listing is still returned immediately and a refresh
+   *   runs in the background, so the next request (usually milliseconds later) sees
+   *   the update;
+   * - an invalidation (created / disposed / renamed here) drops the cache, and only
+   *   then does the next call scan up front — that is when the answer must be current.
    */
   service.list = async (options) => {
     await ready
     if (options?.signal?.aborted === true) throw new DOMException('This operation was aborted', 'AbortError')
-    if (listCache !== undefined && Date.now() - listCache.at < LIST_CACHE_MS) return listCache.value
+    if (listCache !== undefined) {
+      const age = Date.now() - listCache.at
+      if (age < LIST_FRESH_MS) return listCache.value
+      if (age < LIST_STALE_MS) {
+        if (listPromise === undefined) void refreshList().catch(() => {})
+        return listCache.value
+      }
+    }
+    return refreshList()
+  }
+
+  /** Scan every backend and store the merged result (single flight). */
+  function refreshList() {
     if (listPromise !== undefined) return listPromise
     const started = process.hrtime.bigint()
-    const work = computeList()
-    listPromise = work
-    try {
-      const snapshots = await work
-      listCache = { at: Date.now(), value: snapshots }
-      return snapshots
-    } finally {
-      listPromise = undefined
-      recordTiming('list', started)
-    }
+    listPromise = computeList()
+      .then((snapshots) => {
+        listCache = { at: Date.now(), value: snapshots }
+        return snapshots
+      })
+      .finally(() => {
+        listPromise = undefined
+        recordTiming('list', started)
+      })
+    return listPromise
   }
 
   /** One backend's listing, reused for {@link BACKEND_LIST_CACHE_MS}. */
@@ -465,26 +484,50 @@ async function install(ctx, settings, service, urls, log) {
     }
   }
 
-  /** The one expensive lookup: ask every backend, then the central root. */
+  /**
+   * The lookup of last resort, kept cheap on purpose.
+   *
+   * Asking every backend (`backend.stat`) makes each backend read its directories
+   * *and* every session header — 823 header decodes for one unknown id, which is how
+   * a handful of ghost ids used to stall a whole page load. Directory names answer
+   * "does this root own that id?" on their own, so only the owning backend is asked
+   * for a real snapshot.
+   */
   async function scanFor(id) {
+    const encoded = core.encodeSegment(id)
     const projects = [...state.mounted.values()]
-    const hit = (await Promise.all(projects.map(async (project) => {
+    const owners = await Promise.all(projects.map(async (project) => {
+      const ids = await idSetFor(project.root)
+      return ids.has(encoded) ? project : undefined
+    }))
+    for (const project of owners) {
+      if (project === undefined) continue
       try {
-        return (await project.backend.stat(id)) !== undefined ? project : undefined
+        if (await project.backend.stat(id) !== undefined) {
+          remember(id, project.backend, project.root)
+          return project.backend
+        }
       } catch (error) {
         log.warn(`cannot stat "${String(id)}" in ${project.root}: ${describe(error)}`)
-        return undefined
       }
-    }))).find((project) => project !== undefined)
-    if (hit !== undefined) {
-      remember(id, hit.backend, hit.root)
-      return hit.backend
     }
-    if (await original.stat(id) !== undefined) {
+    if ((await idSetFor(settings.root)).has(encoded) && await original.stat(id) !== undefined) {
       remember(id, CENTRAL)
       return CENTRAL
     }
     return undefined
+  }
+
+  /** Session directory names of one root, cached for {@link ID_SET_TTL_MS}. */
+  function idSetFor(root) {
+    const cached = state.idSets.get(root)
+    if (cached !== undefined && Date.now() - cached.at < ID_SET_TTL_MS) return cached.promise
+    const promise = core.sessionIdSet(root).catch((error) => {
+      log.warn(`cannot read the session directory names of ${root}: ${describe(error)}`)
+      return new Set()
+    })
+    state.idSets.set(root, { at: Date.now(), promise })
+    return promise
   }
 
   function mountedForRoot(root) {

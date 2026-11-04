@@ -25,6 +25,7 @@ import {
   resolveSessionsRoot,
   restoreProject,
   sessionDirectory,
+  sessionIdSet,
   skipReason,
   writeIndex,
   writeRegistry,
@@ -297,6 +298,25 @@ test('the session index round-trips and prunes only missing sessions', () => {
   fs.rmSync(base, { recursive: true, force: true })
 })
 
-console.log(`\n${passed} passed, ${failures.length} failed`)
+// The test() helper above is synchronous; the asynchronous helper needs its own await.
+{
+  const { base, project, settings } = fixture()
+  const dir = path.join(projectSessionRoot(settings, project), projectKey(project), encodeSegment('session-known'))
+  fs.mkdirSync(dir, { recursive: true })
+  try {
+    const ids = await sessionIdSet(projectSessionRoot(settings, project))
+    assert.equal(ids.has(encodeSegment('session-known')), true)
+    assert.equal(ids.has(encodeSegment('session-absent')), false)
+    assert.equal((await sessionIdSet(path.join(base, 'nowhere'))).size, 0)
+    passed += 1
+    console.log('ok   sessionIdSet reports directory names without reading headers')
+  } catch (error) {
+    failures.push('sessionIdSet')
+    console.log(`FAIL sessionIdSet\n     ${error instanceof Error ? error.message : String(error)}`)
+  }
+  fs.rmSync(base, { recursive: true, force: true })
+}
 
+
+console.log(`\n${passed} passed, ${failures.length} failed`)
 process.exit(failures.length === 0 ? 0 : 1)
