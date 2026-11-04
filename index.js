@@ -127,7 +127,7 @@ async function install(ctx, settings, service, urls, log) {
    */
   const LIST_FRESH_MS = 15000
   /** Past this age the cached listing is dropped instead of served stale. */
-  const LIST_STALE_MS = 300000
+  const LIST_STALE_MS = 60000
   /** A single backend's snapshot list is trusted as long as the merged one. */
   const BACKEND_LIST_CACHE_MS = 60000
   /** `stat()` answers a change token; 1.5 s of staleness is far cheaper than a rescan. */
@@ -141,9 +141,18 @@ async function install(ctx, settings, service, urls, log) {
   const dropMerged = () => {
     listCache = undefined
   }
-  const invalidateList = () => {
+  /**
+   * Forget only one backend's listing.
+   *
+   * A session created or renamed touches exactly one root, and re-scanning that root
+   * costs milliseconds; re-scanning all 36 costs 1.3 s. The merged cache is dropped so
+   * the next call merges again — from 35 cached backend listings plus one fresh scan.
+   * An unknown backend only drops the merged result: every creation in this process
+   * goes through `create()`, which already invalidated the right one.
+   */
+  const invalidateBackend = (backend) => {
     dropMerged()
-    state.backendLists.clear()
+    if (backend !== undefined) state.backendLists.delete(backend)
     state.idSets.clear()
   }
   const invalidateStat = (id) => {
@@ -156,17 +165,18 @@ async function install(ctx, settings, service, urls, log) {
     const cwd = typeof header?.cwd === 'string' && header.cwd.length > 0 ? header.cwd : undefined
     let backend
     if (cwd !== undefined) backend = await backendFor(cwd)
-    invalidateList()
     invalidateStat(header.id)
     if (backend === undefined) {
       const handle = await original.create(header, options)
       remember(header.id, CENTRAL)
+      invalidateBackend(CENTRAL)
       state.counts.central += 1
       return handle
     }
     try {
       const handle = await backend.create(header, options)
       remember(header.id, backend, core.projectSessionRoot(settings, cwd))
+      invalidateBackend(backend)
       state.counts.created += 1
       return handle
     } catch (error) {
@@ -174,6 +184,7 @@ async function install(ctx, settings, service, urls, log) {
       log.warn(`cannot create "${String(header.id)}" in its project directory (${describe(error)}); using the central root`)
       const handle = await original.create(header, options)
       remember(header.id, CENTRAL)
+      invalidateBackend(CENTRAL)
       return handle
     }
   }
@@ -321,24 +332,28 @@ async function install(ctx, settings, service, urls, log) {
     }
   }
 
+  /**
+   * The backend an event payload refers to, when the payload carries the session id.
+   * `undefined` means "unknown, invalidate broadly".
+   */
+  function backendOfPayload(payload) {
+    const id = payload?.header?.id ?? payload?.id ?? payload?.sessionId
+    return typeof id === 'string' ? state.byId.get(id) : undefined
+  }
+
   // A created, disposed or renamed session changes the merged list right away; the
-  // long cache must not hide it.
-  ctx.on('session/created', () => {
-    invalidateList()
+  // caches must not hide it. Only the owning backend is rescanned: 35 cached listings
+  // stay usable, so the next merge costs one small scan instead of all 36.
+  ctx.on('session/created', (payload) => {
+    invalidateBackend(backendOfPayload(payload))
     invalidateStat()
   })
-  ctx.on('session/disposed', () => {
-    invalidateList()
+  ctx.on('session/disposed', (payload) => {
+    invalidateBackend(backendOfPayload(payload))
     invalidateStat()
   })
   ctx.on('session/title', (payload) => {
-    // A rename only touches one session: refresh that backend's list, keep the rest
-    // cached so a title change does not cost a full scan of every backend.
-    dropMerged()
-    const id = payload?.header?.id ?? payload?.id ?? payload?.sessionId
-    const backend = typeof id === 'string' ? state.byId.get(id) : undefined
-    if (backend !== undefined) state.backendLists.delete(backend)
-    else state.backendLists.clear()
+    invalidateBackend(backendOfPayload(payload))
   })
 
   const reportTimer = setInterval(() => {
