@@ -10,6 +10,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
+  CENTRAL_MARKER,
   centralSessions,
   dshHome,
   encodeSegment,
@@ -18,11 +19,14 @@ import {
   normalizeConfig,
   projectKey,
   projectSessionRoot,
+  pruneIndex,
+  readIndex,
   readRegistry,
   resolveSessionsRoot,
   restoreProject,
   sessionDirectory,
   skipReason,
+  writeIndex,
   writeRegistry,
 } from '../lib/core.js'
 
@@ -268,6 +272,28 @@ test('centralView: false keeps the central root free of links', () => {
   migrateProject(off, project, { force: true })
   assert.equal(fs.existsSync(path.join(off.root, projectKey(project))), false)
   assert.deepEqual(localSessionDirs(off, project), [encodeSegment('session-a')])
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
+test('the session index round-trips and prunes only missing sessions', () => {
+  const { base, project, settings } = fixture()
+  const root = projectSessionRoot(settings, project)
+  const keep = 'session-keep'
+  fs.mkdirSync(path.join(root, projectKey(project), encodeSegment(keep)), { recursive: true })
+  writeIndex(settings, new Map([
+    [keep, root],
+    ['session-gone', root],
+    ['session-central', CENTRAL_MARKER],
+  ]))
+
+  const loaded = readIndex(settings).sessions
+  assert.equal(loaded.get(keep), root)
+  assert.equal(loaded.get('session-gone'), root)
+
+  const removed = pruneIndex(settings, loaded)
+  assert.deepEqual(removed, ['session-gone'])
+  assert.equal(loaded.has(keep), true)
+  assert.equal(loaded.get('session-central'), CENTRAL_MARKER)
   fs.rmSync(base, { recursive: true, force: true })
 })
 

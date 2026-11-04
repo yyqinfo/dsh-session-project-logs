@@ -153,7 +153,16 @@ async function install(ctx, settings, service, urls, log) {
     try {
       const found = await locate(id)
       if (found === undefined) throw new seam.SessionPersistenceNotFoundError(id)
-      return found === CENTRAL ? original.open(id, access, options) : found.open(id, access, options)
+      try {
+        return found === CENTRAL ? await original.open(id, access, options) : await found.open(id, access, options)
+      } catch (error) {
+        if (!(error instanceof seam.SessionPersistenceNotFoundError)) throw error
+        // The cached/indexed location can be stale (a session migrated between
+        // roots, or a hint written before a move): drop it and look again once.
+        const retried = await relocate(id)
+        if (retried === undefined) throw error
+        return retried === CENTRAL ? original.open(id, access, options) : retried.open(id, access, options)
+      }
     } finally {
       recordTiming('open', started)
     }
@@ -164,7 +173,11 @@ async function install(ctx, settings, service, urls, log) {
     try {
       const found = await locate(id)
       if (found === undefined) return undefined
-      return found === CENTRAL ? original.stat(id, options) : found.stat(id, options)
+      const snapshot = found === CENTRAL ? await original.stat(id, options) : await found.stat(id, options)
+      if (snapshot !== undefined) return snapshot
+      const retried = await relocate(id)
+      if (retried === undefined) return undefined
+      return retried === CENTRAL ? original.stat(id, options) : retried.stat(id, options)
     } finally {
       recordTiming('stat', started)
     }
@@ -429,6 +442,17 @@ async function install(ctx, settings, service, urls, log) {
     state.index.set(id, marker)
     state.indexDirty = true
     scheduleIndexWrite()
+  }
+
+  /** Drop a cached location and look the session up from scratch, once. */
+  async function relocate(id) {
+    state.byId.delete(id)
+    state.misses.delete(id)
+    if (state.index.delete(id)) {
+      state.indexDirty = true
+      scheduleIndexWrite()
+    }
+    return scanFor(id)
   }
 
   function scheduleIndexWrite() {
