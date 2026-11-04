@@ -96,11 +96,31 @@ async function install(ctx, settings, service, urls, log) {
 
   const ready = mountRegisteredProjects()
 
+  /**
+   * Per-method timings exposed in the report file: they make "it feels slower"
+   * measurable (how many list/stat calls a page load actually issues).
+   */
+  const timings = new Map()
+  const recordTiming = (name, started) => {
+    const entry = timings.get(name) ?? { calls: 0, ms: 0 }
+    entry.calls += 1
+    entry.ms += Number(process.hrtime.bigint() - started) / 1e6
+    timings.set(name, entry)
+  }
+
+  const LIST_CACHE_MS = 500
+  let listCache
+  let listPromise
+  const invalidateList = () => {
+    listCache = undefined
+  }
+
   service.create = async (header, options) => {
     await ready
     const cwd = typeof header?.cwd === 'string' && header.cwd.length > 0 ? header.cwd : undefined
     let backend
     if (cwd !== undefined) backend = await backendFor(cwd)
+    invalidateList()
     if (backend === undefined) {
       const handle = await original.create(header, options)
       state.byId.set(header.id, CENTRAL)
@@ -122,56 +142,111 @@ async function install(ctx, settings, service, urls, log) {
   }
 
   service.open = async (id, access, options) => {
-    const found = await locate(id)
-    if (found === undefined) throw new seam.SessionPersistenceNotFoundError(id)
-    return found === CENTRAL ? original.open(id, access, options) : found.open(id, access, options)
+    const started = process.hrtime.bigint()
+    try {
+      const found = await locate(id)
+      if (found === undefined) throw new seam.SessionPersistenceNotFoundError(id)
+      return found === CENTRAL ? original.open(id, access, options) : found.open(id, access, options)
+    } finally {
+      recordTiming('open', started)
+    }
   }
 
   service.stat = async (id, options) => {
-    const found = await locate(id)
-    if (found === undefined) return undefined
-    return found === CENTRAL ? original.stat(id, options) : found.stat(id, options)
+    const started = process.hrtime.bigint()
+    try {
+      const found = await locate(id)
+      if (found === undefined) return undefined
+      return found === CENTRAL ? original.stat(id, options) : found.stat(id, options)
+    } finally {
+      recordTiming('stat', started)
+    }
   }
 
+  /**
+   * Merge every backend's listing.
+   *
+   * Two guards keep the page-load path cheap: the project backends are scanned in
+   * parallel instead of one after another, and concurrent callers share one scan
+   * (`listPromise`) whose result is reused for a few hundred milliseconds — the
+   * GUI asks for the list several times while a page loads.
+   */
   service.list = async (options) => {
     await ready
+    const cacheable = options === undefined || options.signal === undefined
+    if (cacheable) {
+      if (listCache !== undefined && Date.now() - listCache.at < LIST_CACHE_MS) return listCache.value
+      if (listPromise !== undefined) return listPromise
+    }
+    const started = process.hrtime.bigint()
+    const work = computeList(options)
+    if (cacheable) listPromise = work
+    try {
+      const snapshots = await work
+      if (cacheable) listCache = { at: Date.now(), value: snapshots }
+      return snapshots
+    } finally {
+      if (cacheable) listPromise = undefined
+      recordTiming('list', started)
+    }
+  }
+
+  async function computeList(options) {
+    const projects = [...state.mounted.values()]
+    const [centralSnapshots, projectLists] = await Promise.all([
+      original.list(options),
+      Promise.all(projects.map((project) => project.backend.list(options).catch((error) => {
+        state.counts.errors += 1
+        log.warn(`cannot list ${project.root}: ${describe(error)}`)
+        return []
+      }).then((value) => value))),
+    ])
     const snapshots = []
-    for (const snapshot of await original.list(options)) {
+    for (const snapshot of centralSnapshots) {
       snapshots.push(snapshot)
       state.byId.set(snapshot.header.id, CENTRAL)
     }
-    for (const project of state.mounted.values()) {
-      let local
-      try {
-        local = await project.backend.list(options)
-      } catch (error) {
-        state.counts.errors += 1
-        log.warn(`cannot list ${project.root}: ${describe(error)}`)
-        continue
-      }
+    projectLists.forEach((local, index) => {
+      const backend = projects[index].backend
       for (const snapshot of local) {
         snapshots.push(snapshot)
-        state.byId.set(snapshot.header.id, project.backend)
+        state.byId.set(snapshot.header.id, backend)
       }
-    }
+    })
     return snapshots
   }
 
   service.flush = async () => {
     await ready
-    await original.flush()
-    const failures = []
-    for (const project of state.mounted.values()) {
-      try {
-        await project.backend.flush()
-      } catch (error) {
-        failures.push(error)
+    const started = process.hrtime.bigint()
+    try {
+      await original.flush()
+      const failures = []
+      for (const project of state.mounted.values()) {
+        try {
+          await project.backend.flush()
+        } catch (error) {
+          failures.push(error)
+        }
       }
+      if (failures.length > 0) throw new AggregateError(failures, 'project-local session flush failed')
+    } finally {
+      recordTiming('flush', started)
     }
-    if (failures.length > 0) throw new AggregateError(failures, 'project-local session flush failed')
   }
 
+  // A created or disposed session changes the merged list right away; the short
+  // cache must not hide it.
+  ctx.on('session/created', () => invalidateList())
+  ctx.on('session/disposed', () => invalidateList())
+
+  const reportTimer = setInterval(() => {
+    if (timings.size > 0) writeReport()
+  }, 10_000)
+  if (typeof reportTimer.unref === 'function') reportTimer.unref()
+
   ctx.effect(() => () => {
+    clearInterval(reportTimer)
     // Leave the provider exactly as it was found: drop the own properties, so the
     // prototype methods take over again even while the host keeps running.
     for (const method of ['create', 'open', 'stat', 'list', 'flush']) delete service[method]
@@ -240,20 +315,29 @@ async function install(ctx, settings, service, urls, log) {
     return mounted.backend
   }
 
-  /** Resolve the backend that owns a session id, filling the index as it goes. */
+  /**
+   * Resolve the backend that owns a session id, filling the index as it goes.
+   *
+   * The fallback asks every project backend at once: a central-root session used
+   * to cost one directory scan per project (33–89 ms measured), which is the kind
+   * of latency a page load multiplies by the number of sessions it touches.
+   */
   async function locate(id) {
     await ready
     const cached = state.byId.get(id)
     if (cached !== undefined) return cached
-    for (const project of state.mounted.values()) {
+    const projects = [...state.mounted.values()]
+    const found = (await Promise.all(projects.map(async (project) => {
       try {
-        if (await project.backend.stat(id) !== undefined) {
-          state.byId.set(id, project.backend)
-          return project.backend
-        }
+        return (await project.backend.stat(id)) !== undefined ? project.backend : undefined
       } catch (error) {
         log.warn(`cannot stat "${String(id)}" in ${project.root}: ${describe(error)}`)
+        return undefined
       }
+    }))).find((backend) => backend !== undefined)
+    if (found !== undefined) {
+      state.byId.set(id, found)
+      return found
     }
     if (await original.stat(id) !== undefined) {
       state.byId.set(id, CENTRAL)
@@ -295,6 +379,11 @@ async function install(ctx, settings, service, urls, log) {
         })),
         registry: [...state.projects].sort(),
         totals: state.counts,
+        timings: Object.fromEntries([...timings].map(([name, entry]) => [name, {
+          calls: entry.calls,
+          totalMs: Math.round(entry.ms),
+          avgMs: Math.round((entry.ms / entry.calls) * 10) / 10,
+        }])),
       }
       fs.mkdirSync(path.dirname(settings.reportPath), { recursive: true })
       fs.writeFileSync(settings.reportPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
