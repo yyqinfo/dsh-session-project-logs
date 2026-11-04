@@ -175,6 +175,17 @@ async function install(ctx, settings, service, urls, log) {
     // prototype methods take over again even while the host keeps running.
     for (const method of ['create', 'open', 'stat', 'list', 'flush']) delete service[method]
     if (state.registryTimer !== undefined) clearTimeout(state.registryTimer)
+    // Withdraw the compatibility views: nothing lists the project roots any more,
+    // so leaving links behind would hide those sessions from every listing.
+    for (const project of state.mounted.values()) {
+      try {
+        if (core.removeCentralView(settings, project.project)) {
+          log.debug(`compatibility view withdrawn: ${project.project}`)
+        }
+      } catch {
+        // Best effort: a leftover link is harmless while the plugin is active.
+      }
+    }
     writeRegistry()
     writeReport()
     log.info('provider restored; new sessions go back to the central root')
@@ -223,6 +234,10 @@ async function install(ctx, settings, service, urls, log) {
     state.counts.mounted += 1
     state.projects.add(path.resolve(cwd))
     scheduleRegistryWrite()
+    // Publish the path-based view so tools that compute
+    // `<root>/<projectKey>/<sessionId>` by hand keep resolving to the real files.
+    const view = core.ensureCentralView(settings, cwd)
+    if (view !== undefined) log.debug(`compatibility view published: ${view}`)
     writeReport()
     log.debug(`project backend mounted for ${cwd} (root ${root})`)
     return mounted.backend
@@ -274,6 +289,7 @@ async function install(ctx, settings, service, urls, log) {
         root: settings.root,
         dirName: settings.dirName,
         centralRoot: settings.root,
+        centralView: settings.centralView,
         platform: process.platform,
         anchoredAt: urls.anchoredAt,
         routedProjects: [...state.mounted.values()].map((project) => ({

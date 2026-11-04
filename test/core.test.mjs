@@ -242,6 +242,35 @@ test('the activity guard leaves a session that looks live in place', () => {
   fs.rmSync(base, { recursive: true, force: true })
 })
 
+test('the compatibility view makes the central path resolve into the project', () => {
+  const { base, project, settings } = fixture()
+  fakeCentralSessions(settings, project, ['session-a'])
+  migrateProject(settings, project, { force: true })
+  const view = path.join(settings.root, projectKey(project))
+  assert.equal(fs.lstatSync(view).isSymbolicLink(), true)
+  assert.equal(fs.existsSync(path.join(view, encodeSegment('session-a'), 'session.v4.jsonl.zstd')), true)
+  // The view is not "central sessions": nothing is left on the central root.
+  const central = centralSessions(settings, project)
+  assert.equal(central.linked, true)
+  assert.deepEqual(central.sessions, [])
+  assert.equal(migrateProject(settings, project, { force: true }).status, 'already-local')
+  // Restoring drops the view first, then lands the sessions in a real directory.
+  assert.equal(restoreProject(settings, project).status, 'restored')
+  assert.equal(fs.lstatSync(view).isSymbolicLink(), false)
+  assert.deepEqual(centralSessions(settings, project).sessions.sort(), ['session-a'])
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
+test('centralView: false keeps the central root free of links', () => {
+  const { base, project, settings } = fixture()
+  const off = normalizeConfig({ root: settings.root, statePath: settings.statePath, centralView: false })
+  fakeCentralSessions(off, project, ['session-a'])
+  migrateProject(off, project, { force: true })
+  assert.equal(fs.existsSync(path.join(off.root, projectKey(project))), false)
+  assert.deepEqual(localSessionDirs(off, project), [encodeSegment('session-a')])
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
 console.log(`\n${passed} passed, ${failures.length} failed`)
 
 process.exit(failures.length === 0 ? 0 : 1)

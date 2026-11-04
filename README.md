@@ -72,6 +72,26 @@ node bin/session-project-logs.mjs restore --all            # 反悔：搬回中�
 `migrate` 的目标范围：不带参数时是**插件登记过的项目**（`$DSH_HOME/logs/session-project-logs.state.json`），
 `--all` 则从中心根目录的会话头里反查全部项目。项目目录已不存在、或落在用户主目录/临时目录/盘符根的项目不会搬。
 
+## 与路径类插件共存（兼容视图）
+
+有些插件**不向宿主询问**会话目录，而是自己按 `~/.dsh/sessions/<projectKey(cwd)>/<sessionId>` 现推路径
+（例如 `@xrn1997/dsh-session-delete`），项目内存储会让它们报「会话目录不存在」。
+
+插件默认维护一个**兼容视图**：把 `<root>/<projectKey>` 做成指向
+`<项目>/<dirName>/<projectKey>` 的目录链接（Windows junction / POSIX symlink）。效果：
+
+- 宿主后端枚举项目目录用的是 `Dirent.isDirectory()`，链接不算目录 → **不会重复列出、不会双写**；
+- 通过该路径做的**内部操作**（读目录大小、把会话目录 `rename` 进回收站、再 `rename` 回来）
+  作用于项目里的真实目录，删除/恢复能真正生效；
+- 插件停用时会自动撤掉这些链接；不想要就配置 `centralView: false`。
+
+⚠️ **`~/.dsh/sessions` 不再"空着"**：里面会出现指向项目的链接。**不要递归删除或移动这个目录**
+（`rm -rf`、资源管理器删除都会顺着链接删进项目目录）。要清理只删**非链接**的子项。
+
+⚠️ **跨卷限制**：`dsh-session-delete` 用 `rename` 搬目录，`$DSH_HOME` 与项目不在同一卷时会 `EXDEV`
+失败（它自己的代码里就明确拒绝跨卷）。这类项目若要能删会话，只有两条路：
+用 `ignore` 让该项目保持中心存储（再 `restore` 该项目），或等上游加"复制后删除"的回退。
+
 ## 安装
 
 本机试用直接指向源码目录即可（pnpm 用 `link:`，改代码立即生效）：
@@ -193,6 +213,7 @@ git 地址与 tarball URL 也可以直接作为目标。
 | `root` | `$DSH_HOME/sessions` | 官方后端使用的中心根目录；只有自定义过持久化 root 时才需要填 |
 | `dirName` | `.dsh/sessions` | 项目内的日志目录（相对项目根，必须在项目内） |
 | `routeNewSessions` | `true` | 是否把新会话分流到项目目录；`false` 时只保留离线迁移能力 |
+| `centralView` | `true` | 是否在中心根目录维护指向项目的兼容视图（给按路径推算目录的第三方插件用） |
 | `gitignore` | `true` | 在项目日志目录写 `.gitignore`（`*` + `!.gitignore`），避免误提交 |
 | `ignore` | `[]` | 额外跳过的绝对路径前缀 |
 | `statePath` | `$DSH_HOME/logs/session-project-logs.state.json` | 项目登记表；`false` 关闭（关闭后 CLI 需显式指定项目目录） |
