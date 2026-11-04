@@ -15,7 +15,7 @@
     "session-project-logs": "./bin/session-project-logs.mjs"
   },
   "scripts": {
-    "test": "node test/core.test.mjs && node test/routing.test.mjs"
+    "test": "node test/core.test.mjs && node test/view.test.mjs && node test/routing.test.mjs"
   },
   "files": [
     "index.js",
