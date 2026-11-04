@@ -96,7 +96,7 @@ async function install(ctx, settings, service, urls, log) {
     idSets: new Map(), // root -> { at, promise<Set<encoded id>> }
     statCache: new Map(), // session id -> { at, snapshot }
     projects: new Set(core.readRegistry(settings).projects),
-    counts: { created: 0, central: 0, mounted: 0, fallbacks: 0, errors: 0 },
+    counts: { created: 0, central: 0, mounted: 0, fallbacks: 0, errors: 0, listScans: 0, listCached: 0, listStale: 0, statCached: 0, missScans: 0, idSetBuilds: 0 },
     registryTimer: undefined,
     indexTimer: undefined,
     indexDirty: false,
@@ -125,11 +125,18 @@ async function install(ctx, settings, service, urls, log) {
    * (a session created, disposed or renamed here) makes the next call scan up front,
    * because that is exactly when the answer must be current.
    */
-  const LIST_FRESH_MS = 15000
-  /** Past this age the cached listing is dropped instead of served stale. */
-  const LIST_STALE_MS = 60000
+  const LIST_FRESH_MS = 30000
+  /**
+   * Past this age the cached listing is dropped instead of served stale.
+   *
+   * Kept generous on purpose: a refresh that lands minutes after the last one used to
+   * pay a full merge (2.4 s in-host). Changes made by this process are never hidden —
+   * `session/created`, `session/disposed` and `session/title` invalidate at once — so
+   * the window only bounds how long a change made by *another* process can be missed.
+   */
+  const LIST_STALE_MS = 180000
   /** A single backend's snapshot list is trusted as long as the merged one. */
-  const BACKEND_LIST_CACHE_MS = 60000
+  const BACKEND_LIST_CACHE_MS = 180000
   /** `stat()` answers a change token; 1.5 s of staleness is far cheaper than a rescan. */
   const STAT_CACHE_MS = 1500
   /** How long a failed lookup is remembered, so repeated misses stop re-scanning. */
@@ -213,7 +220,10 @@ async function install(ctx, settings, service, urls, log) {
     const started = process.hrtime.bigint()
     try {
       const cached = state.statCache.get(id)
-      if (cached !== undefined && Date.now() - cached.at < STAT_CACHE_MS) return cached.snapshot
+      if (cached !== undefined && Date.now() - cached.at < STAT_CACHE_MS) {
+        state.counts.statCached += 1
+        return cached.snapshot
+      }
       const found = await locate(id)
       if (found === undefined) return undefined
       const snapshot = found === CENTRAL ? await original.stat(id, options) : await found.stat(id, options)
@@ -248,8 +258,12 @@ async function install(ctx, settings, service, urls, log) {
     if (options?.signal?.aborted === true) throw new DOMException('This operation was aborted', 'AbortError')
     if (listCache !== undefined) {
       const age = Date.now() - listCache.at
-      if (age < LIST_FRESH_MS) return listCache.value
+      if (age < LIST_FRESH_MS) {
+        state.counts.listCached += 1
+        return listCache.value
+      }
       if (age < LIST_STALE_MS) {
+        state.counts.listStale += 1
         if (listPromise === undefined) void refreshList().catch(() => {})
         return listCache.value
       }
@@ -260,6 +274,7 @@ async function install(ctx, settings, service, urls, log) {
   /** Scan every backend and store the merged result (single flight). */
   function refreshList() {
     if (listPromise !== undefined) return listPromise
+    state.counts.listScans += 1
     const started = process.hrtime.bigint()
     listPromise = computeList()
       .then((snapshots) => {
@@ -509,6 +524,7 @@ async function install(ctx, settings, service, urls, log) {
    * for a real snapshot.
    */
   async function scanFor(id) {
+    state.counts.missScans += 1
     const encoded = core.encodeSegment(id)
     const projects = [...state.mounted.values()]
     const owners = await Promise.all(projects.map(async (project) => {
@@ -537,6 +553,7 @@ async function install(ctx, settings, service, urls, log) {
   function idSetFor(root) {
     const cached = state.idSets.get(root)
     if (cached !== undefined && Date.now() - cached.at < ID_SET_TTL_MS) return cached.promise
+    state.counts.idSetBuilds += 1
     const promise = core.sessionIdSet(root).catch((error) => {
       log.warn(`cannot read the session directory names of ${root}: ${describe(error)}`)
       return new Set()

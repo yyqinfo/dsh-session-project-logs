@@ -1,6 +1,6 @@
 {
   "name": "@local/session-project-logs",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "private": true,
   "type": "module",
   "description": "Keep each project's DSH session logs inside the project (.dsh/sessions) instead of the central ~/.dsh/sessions root",
