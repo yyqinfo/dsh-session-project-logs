@@ -115,17 +115,29 @@ async function install(ctx, settings, service, urls, log) {
     timings.set(name, entry)
   }
 
-  const LIST_CACHE_MS = 3000
-  /** A single backend's snapshot list is reused this long; 823 headers per scan is the cost. */
-  const BACKEND_LIST_CACHE_MS = 5000
+  /**
+   * How long a merged listing is trusted.
+   *
+   * A merge costs one scan of every backend (823 session headers, ~1.5 s in-host),
+   * and the GUI asks for the list on every page load. The window is deliberately
+   * long: a session created, disposed or renamed *here* drops the cache at once
+   * (`session/created` / `session/disposed` / `session/title`), so the only thing
+   * the window can hide is a change made by another process.
+   */
+  const LIST_CACHE_MS = 60000
+  /** A single backend's snapshot list is trusted as long as the merged one. */
+  const BACKEND_LIST_CACHE_MS = 60000
   /** `stat()` answers a change token; 1.5 s of staleness is far cheaper than a rescan. */
   const STAT_CACHE_MS = 1500
   /** How long a failed lookup is remembered, so repeated misses stop re-scanning. */
   const MISS_TTL_MS = 5000
   let listCache
   let listPromise
-  const invalidateList = () => {
+  const dropMerged = () => {
     listCache = undefined
+  }
+  const invalidateList = () => {
+    dropMerged()
     state.backendLists.clear()
   }
   const invalidateStat = (id) => {
@@ -290,8 +302,8 @@ async function install(ctx, settings, service, urls, log) {
     }
   }
 
-  // A created or disposed session changes the merged list and the change tokens
-  // right away; the caches must not hide it.
+  // A created, disposed or renamed session changes the merged list right away; the
+  // long cache must not hide it.
   ctx.on('session/created', () => {
     invalidateList()
     invalidateStat()
@@ -299,6 +311,15 @@ async function install(ctx, settings, service, urls, log) {
   ctx.on('session/disposed', () => {
     invalidateList()
     invalidateStat()
+  })
+  ctx.on('session/title', (payload) => {
+    // A rename only touches one session: refresh that backend's list, keep the rest
+    // cached so a title change does not cost a full scan of every backend.
+    dropMerged()
+    const id = payload?.header?.id ?? payload?.id ?? payload?.sessionId
+    const backend = typeof id === 'string' ? state.byId.get(id) : undefined
+    if (backend !== undefined) state.backendLists.delete(backend)
+    else state.backendLists.clear()
   })
 
   const reportTimer = setInterval(() => {
