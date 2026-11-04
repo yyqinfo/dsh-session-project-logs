@@ -10,6 +10,7 @@
  *   session-project-logs status  [--json]
  *   session-project-logs migrate [<projectDir> ...] [--dry-run] [--json]
  *   session-project-logs restore [<projectDir> ...] [--dry-run] [--json]
+ *   session-project-logs views   status | strip | repair [--dry-run]
  *   session-project-logs doctor  [--json]
  */
 import fs from 'node:fs'
@@ -18,11 +19,14 @@ import {
   discoverCentralProjects,
   dshHome,
   inspectProject,
+  inspectView,
   migrateProject,
   normalizeConfig,
   readRegistry,
+  repairViews,
   resolveSessionsRoot,
   restoreProject,
+  stripViews,
   writeRegistry,
 } from '../lib/core.js'
 import { resolveHarnessModuleUrls } from '../lib/harness.js'
@@ -34,6 +38,7 @@ Usage:
   session-project-logs status  [--root <dir>] [--json]
   session-project-logs migrate (--all | <projectDir> ...) [--root <dir>] [--dry-run] [--force] [--json]
   session-project-logs restore (--all | <projectDir> ...) [--root <dir>] [--dry-run] [--json]
+  session-project-logs views   status | strip | repair [--dry-run] [--force] [--json]
   session-project-logs doctor  [--json]
   session-project-logs help
 
@@ -49,6 +54,13 @@ Options:
   --json         Machine-readable output
 
 migrate and restore move session directories: stop DSH first.
+
+views:
+  status   what each project's compatibility view looks like (link / missing / copy)
+  strip    remove the views — run this BEFORE syncing the harness home elsewhere,
+           because a sync tool that follows links copies the target into place
+  repair   turn a copy back into a link; refuses when the copy holds sessions or
+           larger logs the project does not have (migrate those first)
 `
 
 function takeOption(name) {
@@ -178,6 +190,61 @@ function syncRegistry(candidates) {
   }
   writeRegistry(settings, keep)
   console.log(`registry: ${keep.length} project(s) keep their sessions locally (${settings.statePath})`)
+}
+
+if (command === 'views') {
+  const action = targeted.shift() ?? 'status'
+  const projects = projectsToAct()
+  if (action === 'status') {
+    const rows = projects.map((project) => inspectView(settings, project))
+    if (json) {
+      console.log(JSON.stringify(rows, null, 2))
+      process.exit(0)
+    }
+    for (const row of rows) {
+      const detail = row.kind === 'link'
+        ? (row.correct ? `-> ${row.target}` : `-> ${row.target ?? '(unreadable)'}  (points elsewhere)`)
+        : row.kind === 'directory'
+          ? `real directory: ${row.central} session(s) in the root, ${row.local} in the project${row.onlyCentral.length > 0 ? `, ${row.onlyCentral.length} only in the root` : ''}${row.divergent.length > 0 ? `, ${row.divergent.length} with a larger copy in the root` : ''}`
+          : 'missing — the plugin recreates it on its next start'
+      console.log(`${row.kind.padEnd(10)} ${row.viewPath}\n           ${detail}`)
+    }
+    const counts = { link: 0, directory: 0, missing: 0 }
+    for (const row of rows) counts[row.kind] += 1
+    console.log(`\n${rows.length} project(s): ${counts.link} link(s), ${counts.directory} real director${counts.directory === 1 ? 'y' : 'ies'}, ${counts.missing} missing`)
+    if (counts.directory > 0) console.log('a real directory where a link belongs is what a link-following sync leaves behind; run "views repair"')
+    process.exit(0)
+  }
+  if (action === 'strip') {
+    const links = projects.map((project) => inspectView(settings, project)).filter((row) => row.kind === 'link')
+    if (dryRun) {
+      for (const row of links) console.log(`would remove ${row.viewPath}`)
+      console.log(`\n${links.length} view(s) would be removed; the project directories themselves are untouched`)
+      process.exit(0)
+    }
+    const removed = stripViews(settings, targeted.length > 0 ? projects : undefined)
+    for (const viewPath of removed) console.log(`removed ${viewPath}`)
+    console.log(`\n${removed.length} view(s) removed — the sessions live inside their projects, untouched`)
+    console.log('sync now; DSH on the other machine recreates the views it needs on its next start')
+    process.exit(0)
+  }
+  if (action === 'repair') {
+    const results = repairViews(settings, projects, { dryRun, force })
+    if (json) {
+      console.log(JSON.stringify(results, null, 2))
+      process.exit(results.some((row) => row.status === 'blocked' || row.status === 'error') ? 1 : 0)
+    }
+    for (const row of results) {
+      console.log(`${row.status.padEnd(15)} ${row.viewPath}${row.reason ? `\n                ${row.reason}` : ''}`)
+    }
+    const blocked = results.filter((row) => row.status === 'blocked').length
+    const fixed = results.filter((row) => row.status === 'replaced' || row.status === 'created' || row.status === 'repointed').length
+    const changed = results.filter((row) => row.status.startsWith('would-')).length
+    console.log(`\n${dryRun ? `would fix ${changed}` : `fixed ${fixed}`} view(s)${blocked > 0 ? `, ${blocked} blocked` : ''}`)
+    if (blocked > 0) console.log('blocked projects: run "migrate <project>" (with DSH stopped) to move the extra sessions into the project, then repair again')
+    process.exit(blocked > 0 ? 1 : 0)
+  }
+  usage(`unknown views action: ${action} (expected status, strip or repair)`)
 }
 
 if (command === 'doctor') {

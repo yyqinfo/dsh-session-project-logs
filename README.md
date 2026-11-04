@@ -94,6 +94,41 @@ node bin/session-project-logs.mjs restore --all            # 反悔：搬回中�
 失败（它自己的代码里就明确拒绝跨卷）。这类项目若要能删会话，只有两条路：
 用 `ignore` 让该项目保持中心存储（再 `restore` 该项目），或等上游加"复制后删除"的回退。
 
+## 同步到另一台机器（Junction 会被"跟进去"）
+
+兼容视图是 **junction / 符号链接**，只在**本机**有意义。同步工具对它的处理各不相同：
+
+| 工具 | 默认行为 | 规避 |
+| --- | --- | --- |
+| robocopy | 跟进去，把目标**复制成真目录** | 加 `/XJ`（或 `/SJ`）排除 junction |
+| `rsync -a` | 复制链接本身 | 不要加 `-L` / `--copy-links` |
+| Syncthing / OneDrive / 网盘 | 多数会跟随或忽略 | 用忽略规则排除 `sessions/<key>` |
+
+**视图是派生状态，正确做法是"同步前撤掉、落地后重建"：**
+
+```powershell
+# 同步前（本机）
+node bin/session-project-logs.mjs views strip --dry-run   # 先看会删哪些
+node bin/session-project-logs.mjs views strip             # 撤掉链接，项目里的真实日志不动
+# ……执行同步……
+# 另一台机器启动 DSH 后，插件按需自动重建视图；也可以立刻手动重建：
+node bin/session-project-logs.mjs views repair
+```
+
+**已经被同步成"真目录"了怎么办？** 在目标机器上：
+
+```powershell
+node bin/session-project-logs.mjs views status   # 逐个报告 link / 真目录 / 缺失
+node bin/session-project-logs.mjs views repair   # 副本内容都在项目里 → 删副本、换回链接
+```
+
+`views repair` 只在**安全**时替换：副本里若有多出来的会话（`only in the root`）、或某会话的日志
+比项目里的大（说明有人在副本上写过），会报 `blocked` 并**保持原样**。
+处理办法：先 `migrate <project>` 把这些会话搬进项目，再 `views repair`。
+
+目标机器如果**不需要**按路径推算目录的插件（例如不装 `dsh-session-delete`），最省事的做法是
+直接把它配成 `centralView: false`——那里根本不生成 junction，同步自然没这个麻烦。
+
 ## 安装
 
 本机试用直接指向源码目录即可（pnpm 用 `link:`，改代码立即生效）：

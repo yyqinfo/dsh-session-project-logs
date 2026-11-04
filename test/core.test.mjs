@@ -15,6 +15,7 @@ import {
   dshHome,
   encodeSegment,
   inspectProject,
+  inspectView,
   migrateProject,
   normalizeConfig,
   projectKey,
@@ -22,11 +23,13 @@ import {
   pruneIndex,
   readIndex,
   readRegistry,
+  repairViews,
   resolveSessionsRoot,
   restoreProject,
   sessionDirectory,
   sessionIdSet,
   skipReason,
+  stripViews,
   writeIndex,
   writeRegistry,
 } from '../lib/core.js'
@@ -298,9 +301,66 @@ test('the session index round-trips and prunes only missing sessions', () => {
   fs.rmSync(base, { recursive: true, force: true })
 })
 
-// The test() helper above is synchronous; the asynchronous helper needs its own await.
-{
+test('a synced copy of a view is repaired back into a link', () => {
   const { base, project, settings } = fixture()
+  fakeCentralSessions(settings, project, ['session-a'])
+  migrateProject(settings, project, { force: true })
+  const view = path.join(settings.root, projectKey(project))
+  assert.equal(inspectView(settings, project).kind, 'link')
+  assert.equal(inspectView(settings, project).correct, true)
+
+  // What a link-following sync leaves behind: a real directory holding a copy.
+  const copy = path.join(base, 'copied-view')
+  fs.cpSync(view, copy, { recursive: true, dereference: true })
+  fs.unlinkSync(view)
+  fs.renameSync(copy, view)
+  const materialised = inspectView(settings, project)
+  assert.equal(materialised.kind, 'directory')
+  assert.deepEqual(materialised.onlyCentral, [])
+  assert.deepEqual(materialised.divergent, [])
+
+  const results = repairViews(settings, [project], {})
+  assert.equal(results[0].status, 'replaced')
+  assert.equal(fs.lstatSync(view).isSymbolicLink(), true)
+  assert.deepEqual(localSessionDirs(settings, project), [encodeSegment('session-a')])
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
+test('repair refuses to drop a copy that holds sessions of its own', () => {
+  const { base, project, settings } = fixture()
+  fakeCentralSessions(settings, project, ['session-a'])
+  migrateProject(settings, project, { force: true })
+  const view = path.join(settings.root, projectKey(project))
+  // Materialise the view, then add a session that only the copy has.
+  const copy = path.join(base, 'copied-view')
+  fs.cpSync(view, copy, { recursive: true, dereference: true })
+  fs.unlinkSync(view)
+  fs.renameSync(copy, view)
+  fs.mkdirSync(path.join(view, encodeSegment('session-orphan')), { recursive: true })
+
+  const results = repairViews(settings, [project], {})
+  assert.equal(results[0].status, 'blocked')
+  assert.deepEqual(results[0].onlyCentral, [encodeSegment('session-orphan')])
+  assert.equal(fs.lstatSync(view).isSymbolicLink(), false)
+  assert.equal(fs.existsSync(path.join(view, encodeSegment('session-orphan'))), true)
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
+test('stripViews removes the links and leaves the projects alone', () => {
+  const { base, project, settings } = fixture()
+  fakeCentralSessions(settings, project, ['session-a'])
+  migrateProject(settings, project, { force: true })
+  const view = path.join(settings.root, projectKey(project))
+  assert.equal(fs.lstatSync(view).isSymbolicLink(), true)
+
+  assert.deepEqual(stripViews(settings), [view])
+  assert.equal(fs.existsSync(view), false)
+  assert.deepEqual(localSessionDirs(settings, project), [encodeSegment('session-a')])
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
+// The test() helper above is synchronous; the asynchronous helper needs its own await.
+{  const { base, project, settings } = fixture()
   const dir = path.join(projectSessionRoot(settings, project), projectKey(project), encodeSegment('session-known'))
   fs.mkdirSync(dir, { recursive: true })
   try {
