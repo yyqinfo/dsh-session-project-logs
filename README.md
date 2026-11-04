@@ -169,3 +169,17 @@ Host 日志里插件的前缀是 `[session-project-logs]`。
 - **`~/.dsh/sessions` 里可能残留空的 `--项目键--` 目录**（会话搬走后），可手工删除。
 - **子目录各自成键**：会话 `cwd` 是项目子目录时按后端既定规则单独成键，插件不做合并。
 - **依赖官方包路径**：如果将来的 DSH 改了包布局或持久化实现，插件会在启动时检测到身份不符并自动放弃（不写坏数据）。
+
+## 开发与 CI
+
+本地跑测试（Node 内置模块，无需 install）：
+
+```
+npm test
+```
+
+`test/core.test.mjs` 覆盖布局、跳过规则、离线迁移/回滚与登记表；
+`test/routing.test.mjs` 用真实的官方包做路由集成测试，解析不到官方包时自动跳过。
+
+CI 配置放在 [`ci/test.yml`](ci/test.yml)。需要启用时把它复制成 `.github/workflows/test.yml` 并用网页提交
+（用 PAT 推送 workflow 文件需要 token 带 `Workflows: Read and write` 权限，网页提交不需要）。
