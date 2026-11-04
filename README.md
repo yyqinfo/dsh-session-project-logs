@@ -52,17 +52,25 @@
 
 ## 迁移历史会话（离线，需停止 DSH）
 
-运行中的写句柄会继续写它被打开时所在的根目录，所以历史会话的搬迁必须**停掉 DSH** 再做：
+**为什么必须停 DSH**：后端把 `root` 固定在进程里，并且每次追加都按 `root + cwd + id` 重新算路径。
+会话目录被搬走后，运行中的写句柄下次追加会指向一个不存在的目录，日志就写不进去了（实测踩过：
+搬走了正在跑的那个会话，必须重启 DSH 才恢复）。
+
+所以：
 
 ```
-node bin/session-project-logs.mjs status                 # 看每个项目的中心/项目内会话数
-node bin/session-project-logs.mjs migrate --dry-run      # 预览
-node bin/session-project-logs.mjs migrate                # 真正搬迁（需先停止 DSH）
-node bin/session-project-logs.mjs restore --dry-run      # 反悔：搬回中心根目录
+node bin/session-project-logs.mjs status                  # 看每个项目的中心/项目内会话数
+node bin/session-project-logs.mjs migrate --dry-run --all  # 预览全量
+node bin/session-project-logs.mjs migrate --all            # 真正搬迁（先停 DSH）
+node bin/session-project-logs.mjs restore --all            # 反悔：搬回中心根目录
 ```
 
-`migrate` 只搬**插件登记过的项目**（`$DSH_HOME/logs/session-project-logs.state.json`），
-目录已经不存在、或落在用户主目录/临时目录/盘符根的项目不会被搬。
+**活动保护**：`migrate` 会跳过最近 `--quiet`（默认 10）分钟内有写入的会话，并打印
+`written N min ago, looks live — left in place`。真要搬就在停掉 DSH 后重跑；确实需要强制时用
+`--force`，但正在运行的会话会因此写不进日志。
+
+`migrate` 的目标范围：不带参数时是**插件登记过的项目**（`$DSH_HOME/logs/session-project-logs.state.json`），
+`--all` 则从中心根目录的会话头里反查全部项目。项目目录已不存在、或落在用户主目录/临时目录/盘符根的项目不会搬。
 
 ## 安装
 

@@ -131,12 +131,12 @@ test('migrateProject moves every central session into the project', () => {
   const { base, project, settings } = fixture()
   fakeCentralSessions(settings, project, ['session-a', 'session-b'])
   assert.equal(centralSessions(settings, project).sessions.length, 2)
-  const dry = migrateProject(settings, project, { dryRun: true })
+  const dry = migrateProject(settings, project, { dryRun: true, force: true })
   assert.equal(dry.status, 'dry-run')
   assert.equal(dry.moved, 2)
   assert.equal(localSessionDirs(settings, project).length, 0)
 
-  const result = migrateProject(settings, project)
+  const result = migrateProject(settings, project, { force: true })
   assert.equal(result.status, 'migrated')
   assert.equal(result.moved, 2)
   assert.deepEqual(localSessionDirs(settings, project), ['session-a', 'session-b'])
@@ -148,9 +148,9 @@ test('migrateProject moves every central session into the project', () => {
 
 test('migrateProject is a no-op for an empty project and reports skipped ones', () => {
   const { base, project, settings } = fixture()
-  assert.equal(migrateProject(settings, project).status, 'empty')
+  assert.equal(migrateProject(settings, project, { force: true }).status, 'empty')
   const missing = path.join(base, 'does-not-exist')
-  const skipped = migrateProject(settings, missing)
+  const skipped = migrateProject(settings, missing, { force: true })
   assert.equal(skipped.status, 'skipped')
   assert.match(String(skipped.reason), /does not exist/)
   fs.rmSync(base, { recursive: true, force: true })
@@ -159,7 +159,7 @@ test('migrateProject is a no-op for an empty project and reports skipped ones', 
 test('restoreProject moves the sessions back to the central root', () => {
   const { base, project, settings } = fixture()
   fakeCentralSessions(settings, project, ['session-a', 'session-b'])
-  migrateProject(settings, project)
+  migrateProject(settings, project, { force: true })
   const result = restoreProject(settings, project)
   assert.equal(result.status, 'restored')
   assert.equal(result.moved, 2)
@@ -173,7 +173,7 @@ test('a name clash is reported instead of overwritten', () => {
   fakeCentralSessions(settings, project, ['session-a'])
   const target = path.join(projectSessionRoot(settings, project), projectKey(project), 'session-a')
   fs.mkdirSync(target, { recursive: true })
-  const result = migrateProject(settings, project)
+  const result = migrateProject(settings, project, { force: true })
   assert.equal(result.status, 'partial')
   assert.equal(result.failed, 1)
   assert.equal(fs.existsSync(path.join(settings.root, projectKey(project), 'session-a')), true)
@@ -183,7 +183,7 @@ test('a name clash is reported instead of overwritten', () => {
 test('inspectProject reports both sides', () => {
   const { base, project, settings } = fixture()
   fakeCentralSessions(settings, project, ['session-a', 'session-b'])
-  migrateProject(settings, project, { dryRun: true })
+  migrateProject(settings, project, { dryRun: true, force: true })
   const report = inspectProject(settings, project)
   assert.equal(report.central.sessions, 2)
   assert.equal(report.local.sessions, 0)
@@ -218,5 +218,30 @@ test('projects living under the harness home stay eligible', () => {
   }
 })
 
+test('the activity guard leaves a session that looks live in place', () => {
+  const { base, project, settings } = fixture()
+  fakeCentralSessions(settings, project, ['session-live', 'session-idle'])
+  // Age one session so it is clearly idle, keep the other one fresh.
+  const stale = new Date(Date.now() - 60 * 60 * 1000)
+  fs.utimesSync(path.join(settings.root, projectKey(project), 'session-idle', 'session.v4.jsonl.zstd'), stale, stale)
+
+  const preview = migrateProject(settings, project, { dryRun: true, quietMinutes: 10 })
+  assert.equal(preview.status, 'dry-run-active')
+  assert.equal(preview.moved, 1)
+  assert.deepEqual(preview.skipped.map((entry) => entry.name), ['session-live'])
+
+  const result = migrateProject(settings, project, { quietMinutes: 10 })
+  assert.equal(result.status, 'migrated-with-skips')
+  assert.equal(result.moved, 1)
+  assert.deepEqual(localSessionDirs(settings, project), [encodeSegment('session-idle')])
+  assert.deepEqual(centralSessions(settings, project).sessions, [encodeSegment('session-live')])
+
+  const forced = migrateProject(settings, project, { force: true })
+  assert.equal(forced.moved, 1)
+  assert.equal(centralSessions(settings, project).sessions.length, 0)
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
 console.log(`\n${passed} passed, ${failures.length} failed`)
+
 process.exit(failures.length === 0 ? 0 : 1)

@@ -23,6 +23,7 @@ import {
   readRegistry,
   resolveSessionsRoot,
   restoreProject,
+  writeRegistry,
 } from '../lib/core.js'
 import { resolveHarnessModuleUrls } from '../lib/harness.js'
 
@@ -31,7 +32,7 @@ const help = `session-project-logs — keep each project's DSH session logs insi
 
 Usage:
   session-project-logs status  [--root <dir>] [--json]
-  session-project-logs migrate (--all | <projectDir> ...) [--root <dir>] [--dry-run] [--json]
+  session-project-logs migrate (--all | <projectDir> ...) [--root <dir>] [--dry-run] [--force] [--json]
   session-project-logs restore (--all | <projectDir> ...) [--root <dir>] [--dry-run] [--json]
   session-project-logs doctor  [--json]
   session-project-logs help
@@ -43,6 +44,8 @@ Options:
   --all          Act on every project recovered from the central root's headers
                  (default for migrate/restore is the plugin's project registry)
   --dry-run      Report what would move without touching anything
+  --force        Move sessions even if their log changed in the last minutes
+  --quiet <min>  Activity window for the "looks live" guard (default 10)
   --json         Machine-readable output
 
 migrate and restore move session directories: stop DSH first.
@@ -66,14 +69,17 @@ function takeFlag(name) {
 const root = takeOption('--root')
 const dirName = takeOption('--dir')
 const statePath = takeOption('--state')
+const quietOption = takeOption('--quiet')
 const all = takeFlag('--all')
 const dryRun = takeFlag('--dry-run')
+const force = takeFlag('--force')
 const json = takeFlag('--json')
 if (takeFlag('--help') || takeFlag('-h')) {
   console.log(help)
   process.exit(0)
 }
 
+const quietMinutes = Number(quietOption)
 const command = argv.shift() ?? 'help'
 const settings = normalizeConfig({ root, dirName, statePath, dryRun })
 const registry = readRegistry(settings)
@@ -129,25 +135,36 @@ if (command === 'migrate' || command === 'restore') {
   const results = []
   for (const project of projects) {
     const result = command === 'migrate'
-      ? migrateProject(settings, project, { dryRun })
+      ? migrateProject(settings, project, { dryRun, force, quietMinutes })
       : restoreProject(settings, project, { dryRun })
     results.push({ project, ...result })
   }
-  // The registry is what makes a project's local sessions visible after a
-  // restart: record every project that now keeps sessions inside itself, and drop
-  // the ones that no longer do.
-  if (!dryRun) syncRegistry(projects)
   if (json) {
     console.log(JSON.stringify(results, null, 2))
   } else {
     for (const result of results) {
       const counts = `moved ${result.moved}${result.failed ? `, failed ${result.failed}` : ''}`
-      console.log(`${String(result.status).padEnd(10)} ${result.project}  ${result.moved || result.failed ? counts : ''}${result.reason ? ` — ${result.reason}` : ''}`)
+      console.log(`${String(result.status).padEnd(20)} ${result.project}  ${result.moved || result.failed ? counts : ''}${result.reason ? ` — ${result.reason}` : ''}`)
       for (const failure of result.failures ?? []) console.log(`    ! ${failure.name}: ${failure.reason}`)
+      for (const skipped of result.skipped ?? []) {
+        console.log(`    ~ ${skipped.name}: written ${skipped.minutesAgo} min ago, looks live — left in place`)
+      }
     }
     const moved = results.reduce((sum, result) => sum + (result.moved ?? 0), 0)
     const failed = results.reduce((sum, result) => sum + (result.failed ?? 0), 0)
-    console.log(`\n${dryRun ? 'would move' : 'moved'} ${moved} session director${moved === 1 ? 'y' : 'ies'}${failed ? `, ${failed} failed` : ''}`)
+    const skipped = results.reduce((sum, result) => sum + (result.skipped?.length ?? 0), 0)
+    console.log(`\n${dryRun ? 'would move' : 'moved'} ${moved} session director${moved === 1 ? 'y' : 'ies'}${failed ? `, ${failed} failed` : ''}${skipped ? `, ${skipped} skipped as active` : ''}`)
+    if (skipped > 0) console.log('stop DSH and run again (or pass --force; a live session cannot write after its directory moves)')
+  }
+  // The registry is what makes a project's local sessions visible after a
+  // restart: record every project that now keeps sessions inside itself, and drop
+  // the ones that no longer do. A failure here must not hide the move results.
+  if (!dryRun) {
+    try {
+      syncRegistry(projects)
+    } catch (error) {
+      console.error(`warning: could not update the project registry: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
   process.exit(results.some((result) => result.status === 'error' || (result.failed ?? 0) > 0) ? 1 : 0)
 }
