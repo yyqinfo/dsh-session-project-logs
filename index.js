@@ -19,6 +19,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import * as core from './lib/core.js'
 import {
+  forgetMountedBackend,
   loadHarnessModules,
   mountBackend,
   providerBaseClass,
@@ -223,11 +224,7 @@ async function install(ctx, settings, service, urls, log) {
     if (!(mounted.backend instanceof seam.SessionPersistence)) {
       state.counts.errors += 1
       log.error(`the backend mounted for ${cwd} is not the harness persistence class; keeping that project central`)
-      try {
-        await mounted.fiber.dispose?.()
-      } catch {
-        // Ignore: a broken mount is already reported.
-      }
+      forgetMountedBackend(root)
       return undefined
     }
     state.mounted.set(key, { project: path.resolve(cwd), root, backend: mounted.backend })

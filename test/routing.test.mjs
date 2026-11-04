@@ -170,6 +170,24 @@ await test('the registry records the routed projects', () => {
   assert.deepEqual(stored, [path.resolve(projectA), path.resolve(projectB)].sort())
 })
 
+await test('a plugin reload keeps a live session handle writable', async () => {
+  // The host replaces plugins while sessions run (`dsh plugin add`, HMR). The
+  // mounted project backends are parented to the root context for exactly this
+  // reason: unloading the plugin must not close a live session's write handle.
+  const handle = await routed.create(header(projectA, 'session-survivor'), {})
+  await handle.flush()
+  await fiber.dispose()
+  const second = ctx.plugin({
+    name: 'session-project-logs',
+    apply: (inner) => plugin.apply(inner, { root: central, statePath, reportPath: path.join(base, 'report.json') }),
+  })
+  await second.await()
+  await handle.flush() // throws SessionHandleClosedError if the reload closed it
+  await handle.close()
+  assert.equal(fs.existsSync(localFile(projectA, 'session-survivor')), true)
+  await second.dispose()
+})
+
 await test('unloading restores the shipped provider', async () => {
   await fiber.dispose()
   const handle = await ctx.get('sessionPersistence').create(header(projectA, 'session-after-unload'), {})
