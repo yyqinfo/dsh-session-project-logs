@@ -370,11 +370,29 @@ async function install(ctx, settings, service, urls, log) {
     return snapshots
   }
 
+  /**
+   * Scan the backends with a bounded fan-out.
+   *
+   * 36 roots read at once starve whatever else the host is doing (the GUI's own I/O,
+   * projection caches); six at a time costs a little wall clock and leaves the event
+   * loop responsive.
+   */
+  const SCAN_CONCURRENCY = 6
   async function computeList() {
     const projects = [...state.mounted.values()]
-    const [centralSnapshots, projectLists] = await Promise.all([
+    const projectLists = new Array(projects.length)
+    let cursor = 0
+    const workers = Array.from({ length: Math.min(SCAN_CONCURRENCY, Math.max(1, projects.length)) }, async () => {
+      while (cursor < projects.length) {
+        const index = cursor
+        cursor += 1
+        const project = projects[index]
+        projectLists[index] = await backendList(project.backend, project.backend, project.root)
+      }
+    })
+    const [centralSnapshots] = await Promise.all([
       backendList(CENTRAL, original, `the central root ${settings.root}`),
-      Promise.all(projects.map((project) => backendList(project.backend, project.backend, project.root))),
+      Promise.all(workers),
     ])
     const snapshots = []
     const dirs = new Map()
@@ -464,6 +482,7 @@ async function install(ctx, settings, service, urls, log) {
   ctx.effect(() => () => {
     clearInterval(reportTimer)
     clearInterval(lagTimer)
+    clearTimeout(warmTimer)
     clearTimeout(pruneTimer)
     if (state.indexTimer !== undefined) {
       clearTimeout(state.indexTimer)
@@ -493,16 +512,24 @@ async function install(ctx, settings, service, urls, log) {
   writeReport()
   log.info(`routing new sessions into project directories under <project>/${settings.dirName}`)
 
-  // Warm the lookup index in the background: the first page load asks `stat` for
-  // many sessions before it lists, and a warm index turns each of those into a
-  // map hit instead of a scan across every project backend.
-  void ready
-    .then(() => service.list())
-    .then((snapshots) => {
-      flushIndex()
-      log.debug(`session index ready: ${snapshots.length} sessions`)
-    })
-    .catch((error) => log.warn(`cannot warm the session index: ${describe(error)}`))
+  // Warm the lookup index in the background — but *late*.
+  //
+  // Right after a restart the host is already busy (projection caches rebuild, queued
+  // sessions resume); measured: the event loop blocked for 14.4 s and this scan took
+  // 6.6 s when it ran at once. The index is only an accelerator (a miss costs one
+  // directory-name walk), so waiting for the storm to pass is free — and if the GUI
+  // lists first, its result fills the index and no warm scan is needed at all.
+  const warmTimer = setTimeout(() => {
+    void ready
+      .then(() => (listCache === undefined ? service.list() : undefined))
+      .then((snapshots) => {
+        if (snapshots === undefined) return
+        flushIndex()
+        log.debug(`session index ready: ${snapshots.length} sessions`)
+      })
+      .catch((error) => log.warn(`cannot warm the session index: ${describe(error)}`))
+  }, 25_000)
+  if (typeof warmTimer.unref === 'function') warmTimer.unref()
 
   /** Mount every project recorded by the previous run so its sessions stay visible. */
   async function mountRegisteredProjects() {
