@@ -390,10 +390,13 @@ test('scanSessionLogs reports the damage the backend refuses', () => {
   const result = scanSessionLogs(settings, { projects: [project] })
   assert.equal(result.scanned, 3)
   assert.equal(result.findings.length, 2)
-  const byKind = new Map(result.findings.map((finding) => [finding.kind, finding]))
-  assert.deepEqual(byKind.get('gaps').gaps, ['1-4'])
-  assert.equal(byKind.get('gaps').missing, 4)
-  assert.equal(byKind.get('torn').session, torn)
+  const bySession = new Map(result.findings.map((finding) => [finding.session, finding]))
+  // A hole is reported as a broken seq order (the reader expects previous + 1) and the
+  // missing ranges are spelled out for the repair.
+  assert.equal(bySession.get(gapped).kind, 'order')
+  assert.deepEqual(bySession.get(gapped).gaps, ['1-4'])
+  assert.equal(bySession.get(gapped).missing, 4)
+  assert.equal(bySession.get(torn).kind, 'torn')
   fs.rmSync(base, { recursive: true, force: true })
 })
 

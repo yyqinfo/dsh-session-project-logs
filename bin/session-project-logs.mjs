@@ -272,6 +272,7 @@ if (command === 'verify') {
   console.log(`\n${result.findings.length} log(s) the backend will refuse:`)
   for (const finding of result.findings) {
     const detail = [
+      finding.order !== undefined ? `seq order broken at row ${finding.order.at}: expected ${finding.order.expected}, got ${finding.order.actual}` : undefined,
       finding.gaps?.length > 0 ? `seq gap ${finding.gaps.join(', ')} (missing ${finding.missing})` : undefined,
       finding.torn?.length > 0 ? finding.torn.join('; ') : undefined,
       finding.splice !== undefined ? `invalid inbox splice at seq ${finding.splice.seq} (${finding.splice.target}: ${finding.splice.problem})` : undefined,
