@@ -274,6 +274,7 @@ if (command === 'verify') {
     const detail = [
       finding.gaps?.length > 0 ? `seq gap ${finding.gaps.join(', ')} (missing ${finding.missing})` : undefined,
       finding.torn?.length > 0 ? finding.torn.join('; ') : undefined,
+      finding.splice !== undefined ? `invalid inbox splice at seq ${finding.splice.seq} (${finding.splice.target}: ${finding.splice.problem})` : undefined,
       finding.conflicts?.length > 0 ? 'conflict copy available' : undefined,
       finding.reason,
     ].filter(Boolean).join(' | ')

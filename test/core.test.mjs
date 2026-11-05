@@ -397,6 +397,26 @@ test('scanSessionLogs reports the damage the backend refuses', () => {
   fs.rmSync(base, { recursive: true, force: true })
 })
 
+test('scanSessionLogs flags an inbox splice the projection would refuse', () => {
+  const { base, project, settings } = fixture()
+  const frame = (text) => zlib.zstdCompressSync(Buffer.from(text, 'utf8'))
+  const header = JSON.stringify({ type: 'session', version: 4, id: 'session-splice', cwd: project }) + '\n'
+  const dir = path.join(projectSessionRoot(settings, project), projectKey(project), encodeSegment('session-splice'))
+  fs.mkdirSync(dir, { recursive: true })
+  // A cancellation of one pending message, replayed against an empty inbox.
+  fs.writeFileSync(path.join(dir, 'session.v4.jsonl.zstd'), Buffer.concat([
+    frame(header),
+    frame(JSON.stringify({ type: 'agent/inbox/spliced', seq: 0, time: 1, data: { target: 'next-step', start: 0, removedCount: 1, inserted: [] } }) + '\n'),
+  ]))
+
+  const result = scanSessionLogs(settings, { projects: [project] })
+  assert.equal(result.findings.length, 1)
+  assert.equal(result.findings[0].kind, 'splice')
+  assert.equal(result.findings[0].splice.seq, 0)
+  assert.match(result.findings[0].splice.problem, /removedCount 1 exceeds 0 pending/)
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
 // The test() helper above is synchronous; the asynchronous helper needs its own await.
 {  const { base, project, settings } = fixture()
   const dir = path.join(projectSessionRoot(settings, project), projectKey(project), encodeSegment('session-known'))
