@@ -129,6 +129,34 @@ node bin/session-project-logs.mjs views repair   # 副本内容都在项目里 �
 目标机器如果**不需要**按路径推算目录的插件（例如不装 `dsh-session-delete`），最省事的做法是
 直接把它配成 `centralView: false`——那里根本不生成 junction，同步自然没这个麻烦。
 
+## 校验与修复会话日志（0.2.2 起后端更严）
+
+DSH 0.2.2 起会话日志多了两条硬约束，0.2.1 之前能读的日志会被拒：
+
+| 症状 | 触发原因 |
+| --- | --- |
+| `complete frame contains a torn JSONL record` | 某个 zstd 帧没有落在 JSON 记录边界上（记录跨帧、或写入被中断留下半截行） |
+| `invalid committed event at line N: … seq gap (expected X, got Y)` | 序号断档，中间那段事件丢了（块级同步覆盖是最常见的原因） |
+
+```powershell
+node bin/session-project-logs.mjs verify          # 扫描登记项目 + 中心根
+node bin/session-project-logs.mjs verify --all    # 再按中心根的会话头反查项目
+node bin/session-project-logs.mjs verify --json
+```
+
+输出会列出断档范围、缺失条数、帧内残行，以及**同目录有没有同步冲突副本**——
+有副本就能无损合并。修复用 `$DSH_HOME/tools/` 下的两个工具：
+
+```powershell
+node $DSH_HOME\tools\scan-session-logs.mjs --all                              # 全量体检
+node $DSH_HOME\tools\merge-session-log.mjs "<会话目录>\session.v4.jsonl.zstd" --apply
+```
+
+`merge-session-log` 先备份 `.bak-<时间>`、写后自校验，通过才替换原文件。
+有冲突副本时按 `seq` 取"写入时间更晚"的行合并（无损，实测能补回几十到几百条）；
+没有副本时加 `--renumber` 让日志重新可读（缺的事件无法恢复，工具会如实报告）。
+修复完的日志是"每帧恰好一条完整记录"，也是后端最稳的布局。
+
 ## 安装
 
 本机试用直接指向源码目录即可（pnpm 用 `link:`，改代码立即生效）：

@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import zlib from 'node:zlib'
 import {
   CENTRAL_MARKER,
   centralSessions,
@@ -26,6 +27,7 @@ import {
   repairViews,
   resolveSessionsRoot,
   restoreProject,
+  scanSessionLogs,
   sessionDirectory,
   sessionIdSet,
   skipReason,
@@ -356,6 +358,42 @@ test('stripViews removes the links and leaves the projects alone', () => {
   assert.deepEqual(stripViews(settings), [view])
   assert.equal(fs.existsSync(view), false)
   assert.deepEqual(localSessionDirs(settings, project), [encodeSegment('session-a')])
+  fs.rmSync(base, { recursive: true, force: true })
+})
+
+test('scanSessionLogs reports the damage the backend refuses', () => {
+  const { base, project, settings } = fixture()
+  const root = projectSessionRoot(settings, project)
+  const frame = (text) => zlib.zstdCompressSync(Buffer.from(text, 'utf8'))
+  const header = JSON.stringify({ type: 'session', version: 4, id: 'session-x', cwd: project }) + '\n'
+  const row = (seq) => JSON.stringify({ type: 'turn/start', seq, time: 1, data: { turn: seq } }) + '\n'
+
+  // Healthy: every frame holds one complete record.
+  const good = path.join(root, projectKey(project), encodeSegment('session-good'))
+  fs.mkdirSync(good, { recursive: true })
+  fs.writeFileSync(path.join(good, 'session.v4.jsonl.zstd'), Buffer.concat([frame(header), frame(row(0)), frame(row(1))]))
+
+  // A gap: seq 0 then seq 5.
+  const gapped = path.join(root, projectKey(project), encodeSegment('session-gap'))
+  fs.mkdirSync(gapped, { recursive: true })
+  fs.writeFileSync(path.join(gapped, 'session.v4.jsonl.zstd'), Buffer.concat([frame(header), frame(row(0)), frame(row(5))]))
+
+  // A torn record: the last frame stops mid-JSON.
+  const torn = path.join(root, projectKey(project), encodeSegment('session-torn'))
+  fs.mkdirSync(torn, { recursive: true })
+  fs.writeFileSync(path.join(torn, 'session.v4.jsonl.zstd'), Buffer.concat([
+    frame(header),
+    frame(row(0)),
+    frame('{"type":"step/start","seq":1,"time":1,"data":{"tu'),
+  ]))
+
+  const result = scanSessionLogs(settings, { projects: [project] })
+  assert.equal(result.scanned, 3)
+  assert.equal(result.findings.length, 2)
+  const byKind = new Map(result.findings.map((finding) => [finding.kind, finding]))
+  assert.deepEqual(byKind.get('gaps').gaps, ['1-4'])
+  assert.equal(byKind.get('gaps').missing, 4)
+  assert.equal(byKind.get('torn').session, torn)
   fs.rmSync(base, { recursive: true, force: true })
 })
 

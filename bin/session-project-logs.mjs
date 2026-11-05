@@ -26,6 +26,7 @@ import {
   repairViews,
   resolveSessionsRoot,
   restoreProject,
+  scanSessionLogs,
   stripViews,
   writeRegistry,
 } from '../lib/core.js'
@@ -39,6 +40,7 @@ Usage:
   session-project-logs migrate (--all | <projectDir> ...) [--root <dir>] [--dry-run] [--force] [--json]
   session-project-logs restore (--all | <projectDir> ...) [--root <dir>] [--dry-run] [--json]
   session-project-logs views   status | strip | repair [--dry-run] [--force] [--json]
+  session-project-logs verify  [--all | <projectDir> ...] [--json]
   session-project-logs doctor  [--json]
   session-project-logs help
 
@@ -61,6 +63,12 @@ views:
            because a sync tool that follows links copies the target into place
   repair   turn a copy back into a link; refuses when the copy holds sessions or
            larger logs the project does not have (migrate those first)
+
+verify:
+  read every session log and report the damage a sync or a killed write leaves
+  behind — a hole in the seq numbers, or a frame that ends mid-record. Those are
+  exactly what the backend refuses with "stored log is corrupt". Repair them with
+  merge-session-log.mjs (in the harness tools directory).
 `
 
 function takeOption(name) {
@@ -245,6 +253,36 @@ if (command === 'views') {
     process.exit(blocked > 0 ? 1 : 0)
   }
   usage(`unknown views action: ${action} (expected status, strip or repair)`)
+}
+
+if (command === 'verify') {
+  const projects = targeted.length > 0
+    ? targeted.map((value) => path.resolve(value))
+    : (all ? undefined : registry.projects.map((value) => path.resolve(value)))
+  const result = scanSessionLogs(settings, projects === undefined ? {} : { projects })
+  if (json) {
+    console.log(JSON.stringify(result, null, 2))
+    process.exit(result.findings.length > 0 ? 1 : 0)
+  }
+  console.log(`scanned ${result.scanned} session log(s) in ${result.roots.length} root(s)`)
+  if (result.findings.length === 0) {
+    console.log('all logs read cleanly: seq numbers are contiguous and every frame ends on a record')
+    process.exit(0)
+  }
+  console.log(`\n${result.findings.length} log(s) the backend will refuse:`)
+  for (const finding of result.findings) {
+    const detail = [
+      finding.gaps?.length > 0 ? `seq gap ${finding.gaps.join(', ')} (missing ${finding.missing})` : undefined,
+      finding.torn?.length > 0 ? finding.torn.join('; ') : undefined,
+      finding.conflicts?.length > 0 ? 'conflict copy available' : undefined,
+      finding.reason,
+    ].filter(Boolean).join(' | ')
+    console.log(`  ${String(finding.kind ?? 'unreadable').padEnd(9)} ${String(finding.rows ?? '').padStart(5)} rows  ${detail}`)
+    console.log(`            ${finding.session}`)
+  }
+  console.log('\nrepair: node <global tools>/merge-session-log.mjs "<session dir>/session.v4.jsonl.zstd" [--apply]')
+  console.log('        a conflict copy makes the merge lossless; without one, --renumber makes the log readable again')
+  process.exit(1)
 }
 
 if (command === 'doctor') {
