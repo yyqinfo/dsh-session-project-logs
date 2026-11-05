@@ -107,13 +107,53 @@ async function install(ctx, settings, service, urls, log) {
   /**
    * Per-method timings exposed in the report file: they make "it feels slower"
    * measurable (how many list/stat calls a page load actually issues).
+   *
+   * `recent` keeps the last minute only, so a report read right after a slow page load
+   * answers "how slow was it *just now*" instead of averaging over hours.
    */
   const timings = new Map()
+  const recent = new Map()
+  const RECENT_WINDOW_MS = 60_000
   const recordTiming = (name, started) => {
+    const elapsed = Number(process.hrtime.bigint() - started) / 1e6
     const entry = timings.get(name) ?? { calls: 0, ms: 0 }
     entry.calls += 1
-    entry.ms += Number(process.hrtime.bigint() - started) / 1e6
+    entry.ms += elapsed
     timings.set(name, entry)
+    const window = recent.get(name) ?? []
+    const now = Date.now()
+    window.push({ at: now, ms: elapsed })
+    while (window.length > 0 && now - window[0].at > RECENT_WINDOW_MS) window.shift()
+    recent.set(name, window)
+  }
+  const recentSummary = () => Object.fromEntries([...recent].map(([name, window]) => {
+    const now = Date.now()
+    const live = window.filter((sample) => now - sample.at <= RECENT_WINDOW_MS)
+    if (live.length === 0) return [name, { calls: 0 }]
+    const total = live.reduce((sum, sample) => sum + sample.ms, 0)
+    return [name, {
+      calls: live.length,
+      avgMs: Math.round((total / live.length) * 10) / 10,
+      maxMs: Math.round(Math.max(...live.map((sample) => sample.ms))),
+    }]
+  }))
+
+  /**
+   * Event-loop lag: if a call looks slow while this stays near zero, the time was
+   * spent waiting (I/O, another service's queue), not computing.
+   */
+  const LAG_TICK_MS = 200
+  let lagTimer
+  {
+    let last = Date.now()
+    lagTimer = setInterval(() => {
+      const now = Date.now()
+      const lag = now - last - LAG_TICK_MS
+      last = now
+      if (lag > (state.counts.lagMaxMs ?? 0)) state.counts.lagMaxMs = lag
+      state.counts.lagTicks = (state.counts.lagTicks ?? 0) + 1
+    }, LAG_TICK_MS)
+    if (typeof lagTimer.unref === 'function') lagTimer.unref()
   }
 
   /**
@@ -423,6 +463,7 @@ async function install(ctx, settings, service, urls, log) {
 
   ctx.effect(() => () => {
     clearInterval(reportTimer)
+    clearInterval(lagTimer)
     clearTimeout(pruneTimer)
     if (state.indexTimer !== undefined) {
       clearTimeout(state.indexTimer)
@@ -674,6 +715,7 @@ async function install(ctx, settings, service, urls, log) {
           totalMs: Math.round(entry.ms),
           avgMs: Math.round((entry.ms / entry.calls) * 10) / 10,
         }])),
+        recentTimings: recentSummary(),
       }
       fs.mkdirSync(path.dirname(settings.reportPath), { recursive: true })
       fs.writeFileSync(settings.reportPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
